@@ -12,8 +12,10 @@ três variantes de download: PDF direto, visualizador HTML com link para o PDF
 real, e visualizador sem PDF (fallback html.do).
 """
 
+import contextlib
 import csv
 import importlib
+import io
 import os
 import shutil
 import sys
@@ -282,6 +284,20 @@ class TesteScraper(unittest.TestCase):
         self.assertEqual(len(linhas), 4)
         self.assertEqual(self._downloads(), downloads_apos_real,
                          "reexecução não pode repetir downloads")
+
+    def test_diagnostico(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.scraper.main(["--out", self.saida, "--diagnostico", RELATORA])
+        texto = buf.getvalue()
+        self.assertIn("2 resultado(s)", texto)
+        self.assertIn(NUM_A, texto)
+        self.assertFalse(os.path.exists(os.path.join(self.saida, "index.csv")),
+                         "diagnóstico não pode mexer no catálogo")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.scraper.main(["--out", self.saida, "--diagnostico", "Nome Errado"])
+        self.assertIn("Nenhum registro", buf.getvalue())
 
     def test_robots_bloqueado_aborta(self):
         self.servidor.robots_bloqueia = True

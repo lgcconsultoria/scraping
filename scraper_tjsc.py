@@ -488,6 +488,9 @@ def main(argv=None):
                         help="faz as buscas e monta o index.csv sem baixar inteiros teores")
     parser.add_argument("--out", default=OUT_PADRAO,
                         help=f"diretório de saída (padrão: {OUT_PADRAO})")
+    parser.add_argument("--diagnostico", metavar="RELATOR",
+                        help="roda UMA busca só por relator (sem tema/classe) e mostra o "
+                             "total e os primeiros resultados; útil para validar grafias")
     args = parser.parse_args(argv)
 
     saida = args.out
@@ -511,6 +514,22 @@ def main(argv=None):
     except requests.RequestException as exc:
         logging.error("não foi possível acessar %s: %s", BASE, exc)
         sys.exit(1)
+
+    if args.diagnostico:
+        relator = args.diagnostico
+        for registros, total, _pagina, bruto in buscar(cliente, relator, {}, ps=10):
+            caminho_raw = os.path.join(saida, "_raw_html", f"diagnostico_{slug(relator)}.html")
+            _salvar_texto(caminho_raw, bruto)
+            print(f"\nDiagnóstico | relator='{relator}' | {total} resultado(s) no portal "
+                  "(busca só por relator, sem tema/classe)")
+            for reg in registros[:10]:
+                print(f"  {reg['numero_processo'] or '?':<28} | {reg['data_julgamento']:<10} | "
+                      f"relator no portal: {reg['relator']!r} | {reg['orgao_julgador']}")
+            if not registros:
+                print("  Nenhum registro: a grafia provavelmente não bate com o índice do portal.")
+            print(f"  Snapshot salvo em: {caminho_raw}")
+            break
+        return
 
     caminho_csv = os.path.join(saida, "index.csv")
     linhas, por_id = carregar_index(caminho_csv)
