@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+decisoes_tjsc/
+.venv/
+venv/
