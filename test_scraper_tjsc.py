@@ -114,9 +114,18 @@ class Portal(BaseHTTPRequestHandler):
             return
         self._conta("busca")
         tamanho = int(self.headers.get("Content-Length", "0"))
-        corpo = parse_qs(self.rfile.read(tamanho).decode("utf-8"))
+        # Como o portal real, decodifica o corpo do form em ISO-8859-1 e exige
+        # o nome acentuado exato: se o scraper enviar UTF-8, "Cláudia" vira
+        # "ClÃ¡udia" e a busca devolve zero resultados.
+        corpo = parse_qs(self.rfile.read(tamanho).decode("ascii"), encoding="latin-1")
         pagina = int(corpo.get("page", ["1"])[0])
         eixo_frase = bool(corpo.get("frase", [""])[0])
+        if (corpo.get("relator", [""])[0] != RELATORA
+                or corpo.get("frase", [""])[0] not in ("", "tutela de urgência")):
+            self._responder("<html>Considerando que o sistema não encontrou "
+                            "resultados, analise os itens a seguir</html>",
+                            "text/html; charset=utf-8")
+            return
         if eixo_frase:
             # total declarado 60 com ps=50 -> o scraper deve pedir a página 2 e parar
             cabecalho = "<p>60 resultados encontrados</p>"

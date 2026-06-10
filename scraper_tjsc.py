@@ -48,7 +48,7 @@ import sys
 import time
 import unicodedata
 import urllib.robotparser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 
 try:
     import requests
@@ -271,7 +271,13 @@ def buscar(cliente, relator, params_eixo, ps=PS):
             "page": str(pagina),
         }
         corpo.update({chave: str(valor) for chave, valor in params_eixo.items()})
-        resposta = cliente.post(SEARCH, data=corpo, timeout=60)
+        # O backend do portal decodifica o corpo como ISO-8859-1: enviar o
+        # form em UTF-8 corrompe acentos (relator "Cláudia" vira "ClÃ¡udia")
+        # e zera os resultados.
+        dados = urlencode(corpo, encoding="latin-1", errors="replace")
+        resposta = cliente.post(
+            SEARCH, data=dados, timeout=60,
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=ISO-8859-1"})
         html_pagina = texto_resposta(resposta)
         registros, total = parse_resultados(html_pagina)
         yield registros, total, pagina, html_pagina
