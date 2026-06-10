@@ -95,26 +95,38 @@ relatório — nunca classificados como neutros por omissão. Dicionários de
 termos, pesos e limiares ficam no topo de `triagem_tjsc.py`; ajustar um peso
 muda a classificação sem nenhuma outra alteração de código.
 
-## Relatório do caso (API do Claude)
+## Relatório do caso (API do Claude — pipeline de 4 estágios)
 
-O `relatorio_caso_tjsc.py` cruza uma peça do SEU caso (ex.: o agravo de
-instrumento, em md/txt) com os acórdãos baixados: o Claude avalia cada acórdão
-como precedente para a defesa (favorável/contrário/neutro + aplicabilidade
-0-10 + trechos citáveis, em JSON estruturado) e, ao final, redige um relatório
-de precedentes organizado por tese, com parágrafos prontos para a minuta e
-estratégias de distinguishing para os precedentes de risco.
+O `relatorio_caso_tjsc.py` cruza uma peça do SEU caso (ex.: o agravo, em
+md/txt) com os acórdãos baixados, num pipeline desenhado para gastar o mínimo
+de tokens e usar o modelo certo em cada etapa:
+
+1. **Perfil do caso** (Opus, 1×) — lê o agravo UMA vez e destila um perfil
+   estruturado (teses, fatos, precedente ideal). Fica em `perfil_caso.json` e
+   só é refeito se o agravo mudar. Os acórdãos nunca mais leem o agravo inteiro.
+2. **Extração** (Sonnet — econômico) — lê o **inteiro teor completo** de cada
+   acórdão (sem cortes) e extrai ratio, resultado e passagens citáveis literais.
+3. **Aplicação** (Opus) — só nos acórdãos relevantes: avalia posição,
+   aplicabilidade 0-10 e como o precedente apoia/ameaça cada tese.
+4. **Síntese** (Opus, 1×) — relatório por tese, com parágrafos para a minuta.
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."    # chave SÓ via variável de ambiente
-python relatorio_caso_tjsc.py --caso minha_peca.md --limite 5   # teste barato
-python relatorio_caso_tjsc.py --caso minha_peca.md              # análise completa
-python relatorio_caso_tjsc.py --caso minha_peca.md --modelo claude-sonnet-4-6  # mais barato
+python relatorio_caso_tjsc.py --caso agravo.md --limite 5   # teste barato
+python relatorio_caso_tjsc.py --caso agravo.md              # corpus completo
+python relatorio_caso_tjsc.py --caso agravo.md --modelo-pesado claude-opus-4-8 \
+                                                --modelo-leve claude-sonnet-4-6
 ```
 
-Saídas: `decisoes_tjsc/analises_caso.jsonl` (cache retomável — reexecutar não
-re-analisa nem re-cobra o que já foi feito) e `decisoes_tjsc/relatorio_caso.md`.
-A peça do caso entra como contexto com prompt caching (custo ~10x menor nas
-chamadas seguintes) e NÃO deve ser commitada no repositório.
+Saídas em `decisoes_tjsc/`: `relatorio_caso.md` **e `relatorio_caso.docx`**
+(formatado, com títulos, citações em destaque e tabela-apêndice — use
+`--sem-docx` para pular). O cache fica em `perfil_caso.json`,
+`extracoes_caso.jsonl` e `aplicacoes_caso.jsonl`.
+
+**Idempotência total:** reexecutar **não chama a API** se não houver acórdão
+novo no `index.csv` nem alteração no agravo. Acórdão novo dispara só a análise
+dele; agravo alterado refaz o perfil e as aplicações, mas **reaproveita as
+extrações** (que independem do agravo). A peça do caso NÃO deve ser commitada.
 
 > SEGURANÇA: nunca grave a chave de API em código, arquivo versionado ou chat.
 > Use somente a variável de ambiente `ANTHROPIC_API_KEY`. Se uma chave vazar,

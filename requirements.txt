@@ -9,3 +9,4 @@ striprtf>=0.0.26
 
 # relatório do caso (cruzamento caso concreto × acórdãos via API do Claude)
 anthropic>=0.109
+python-docx>=1.1     # relatório final formatado em .docx

@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
-"""Relatório de precedentes do caso concreto via API do Claude.
+"""Relatório de precedentes do caso concreto via API do Claude (pipeline 4 estágios).
 
-Cruza a peça processual do caso (ex.: o agravo de instrumento) com os
-acórdãos do TJSC já baixados pelo scraper, usando o Claude para avaliar,
-acórdão a acórdão, se a decisão serve de precedente PARA A DEFESA, com que
-força, e quais trechos citar — e, ao final, redigir um relatório de
-precedentes organizado por tese, com sugestões de parágrafo para a minuta.
+Cruza a peça do SEU caso com os acórdãos baixados pelo scraper, em quatro
+estágios com modelo e cache pensados para gastar o mínimo de tokens:
+
+  1. PERFIL DO CASO  (Opus, 1x e cacheado em disco)
+       Lê o agravo UMA vez e destila um perfil estruturado (teses, fatos-chave,
+       questões, o precedente ideal de cada tese). Só roda de novo se o agravo
+       mudar (detectado por hash). Os acórdãos NUNCA mais leem o agravo inteiro
+       — usam este perfil compacto.
+
+  2. EXTRAÇÃO        (Sonnet — econômico; lê o acórdão COMPLETO)
+       Lê o inteiro teor inteiro (sem cortes — o contexto importa) e extrai com
+       fidelidade: relevância, ratio decidendi, resultado, fatos e passagens
+       VERBATIM citáveis. Roda só em acórdãos novos do index.csv.
+
+  3. APLICAÇÃO       (Opus — raciocínio jurídico; só nos relevantes)
+       A partir do perfil + extração, avalia como o acórdão se aplica às teses
+       (posição, aplicabilidade 0-10, trechos citáveis, distinguishing). Só os
+       acórdãos que a Extração marcou relevantes chegam aqui.
+
+  4. SÍNTESE         (Opus, 1x) -> relatorio_caso.md
+       Junta as aplicações num relatório por tese, com parágrafos para a minuta.
+
+Idempotência total: tudo é cacheado em disco. Reexecutar NÃO chama a API se
+não houver acórdão novo no index.csv nem alteração no agravo.
 
 Uso:
-    export ANTHROPIC_API_KEY="sk-ant-..."   # nunca grave a chave em arquivo/código
-    python relatorio_caso_tjsc.py --caso minha_peca.md --limite 5   # teste barato
-    python relatorio_caso_tjsc.py --caso minha_peca.md              # análise completa
-
-Saídas (na pasta --out):
-    analises_caso.jsonl   - análise estruturada por acórdão (cache retomável:
-                            reexecutar não re-analisa nem re-cobra o que já foi feito)
-    relatorio_caso.md     - relatório final de precedentes
-
-Arquitetura/custo: a peça do caso entra como bloco de sistema com prompt
-caching (cobrada ~1x na primeira chamada e ~0,1x nas seguintes); cada acórdão
-é analisado com saída estruturada (JSON garantido por schema); a síntese final
-recebe as melhores análises. Modelo padrão: claude-opus-4-8 (mude com
---modelo claude-sonnet-4-6 para reduzir custo). O custo estimado é impresso
-ao final com base no uso real de tokens.
+    export ANTHROPIC_API_KEY="sk-ant-..."        # chave SÓ por variável de ambiente
+    python relatorio_caso_tjsc.py --caso agravo.md --limite 5   # teste barato
+    python relatorio_caso_tjsc.py --caso agravo.md              # corpus completo
 """
 
 import argparse
+import collections
 import csv
+import datetime
+import hashlib
 import json
 import logging
 import os
@@ -38,140 +48,430 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("Este script requer o SDK da Anthropic: pip install anthropic")
 
-import triagem_tjsc  # reutiliza a extração de texto (.pdf/.rtf/.html)
+import triagem_tjsc  # reaproveita a extração de texto (.pdf/.rtf/.html)
 
 OUT_PADRAO = "decisoes_tjsc"
-MODELO_PADRAO = os.environ.get("TJSC_MODELO", "claude-opus-4-8")
-MAX_TOKENS_ANALISE = 16000
-MAX_TOKENS_RELATORIO = 16000
-MIN_CHARS_TEXTO = 200       # menos que isso: documento sem texto útil
-TETO_CHARS_ACORDAO = 45000  # ~12k tokens por acórdão (mantém início e fim)
-TOP_FAVORAVEIS = 25         # quantas análises favoráveis entram na síntese
+# Opus para raciocínio jurídico (perfil, aplicação, síntese); Sonnet para a
+# leitura/extração em massa (mais barato e lê o documento inteiro).
+MODELO_PESADO = os.environ.get("TJSC_MODELO_PESADO", "claude-opus-4-8")
+MODELO_LEVE = os.environ.get("TJSC_MODELO_LEVE", "claude-sonnet-4-6")
 
-# Preço por milhão de tokens (entrada, saída) — cache: escrita 1,25x, leitura 0,1x.
+MAX_TOKENS = {"perfil": 8000, "extracao": 8000, "aplicacao": 12000, "sintese": 16000}
+MIN_CHARS_TEXTO = 200
+TETO_SEGURANCA_CHARS = 1_200_000  # ~360k tokens; acórdão real nunca chega perto
+TOP_FAVORAVEIS = 30               # quantas aplicações favoráveis entram na síntese
+
+# Preço por milhão de tokens (entrada, saída). Cache: escrita 1,25x, leitura 0,1x.
 PRECOS_USD = {
     "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
 
-ESQUEMA_ANALISE = {
+PERFIL_SCHEMA = {
     "type": "json_schema",
     "schema": {
         "type": "object",
         "properties": {
-            "posicao": {
-                "type": "string",
-                "enum": ["favoravel", "contrario", "neutro"],
-                "description": "favoravel: a ratio decidendi apoia tese da defesa do "
-                               "Agravante; contrario: fortalece a parte adversa; "
-                               "neutro: irrelevante ou inconclusivo para o caso.",
+            "teses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "identificador curto, ex.: t1"},
+                        "titulo": {"type": "string"},
+                        "resumo": {"type": "string"},
+                        "precedente_ideal": {
+                            "type": "string",
+                            "description": "que tipo de acórdão apoiaria esta tese.",
+                        },
+                    },
+                    "required": ["id", "titulo", "resumo", "precedente_ideal"],
+                    "additionalProperties": False,
+                },
             },
-            "aplicabilidade": {
-                "type": "integer",
-                "enum": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-                "description": "0-10: identidade fática e jurídica com o caso "
-                               "(10 = precedente praticamente idêntico).",
+            "fatos_chave": {"type": "array", "items": {"type": "string"}},
+            "questoes_juridicas": {"type": "array", "items": {"type": "string"}},
+            "termos_busca": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["teses", "fatos_chave", "questoes_juridicas", "termos_busca"],
+        "additionalProperties": False,
+    },
+}
+
+EXTRACAO_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "relevante": {
+                "type": "boolean",
+                "description": "true se a ratio bear em QUALQUER tese do perfil "
+                               "(apoiando OU ameaçando); false se for matéria diversa.",
             },
-            "teses_apoiadas": {
+            "posicao_preliminar": {"type": "string",
+                                   "enum": ["favoravel", "contrario", "neutro"]},
+            "teses_tocadas": {"type": "array", "items": {"type": "string"},
+                              "description": "ids das teses do perfil (ex.: t1, t3)."},
+            "resultado": {"type": "string",
+                          "description": "provido/desprovido/parcial e a quem aproveita."},
+            "ratio_decidendi": {"type": "string"},
+            "resumo_fatos": {"type": "string"},
+            "passagens_verbatim": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Teses do agravo que o acórdão apoia (ou ameaça, se "
-                               "contrário), em frases curtas.",
+                "description": "Citações LITERAIS do acórdão (cópia exata), candidatas "
+                               "a serem citadas na peça. Não parafraseie.",
             },
-            "resumo_relevancia": {
-                "type": "string",
-                "description": "2-4 frases: o que o acórdão decidiu e por que importa "
-                               "(ou não) para este caso.",
-            },
+        },
+        "required": ["relevante", "posicao_preliminar", "teses_tocadas", "resultado",
+                     "ratio_decidendi", "resumo_fatos", "passagens_verbatim"],
+        "additionalProperties": False,
+    },
+}
+
+APLICACAO_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "posicao": {"type": "string", "enum": ["favoravel", "contrario", "neutro"]},
+            "aplicabilidade": {"type": "integer", "enum": list(range(11)),
+                               "description": "0-10: identidade fática e jurídica com o caso."},
+            "teses_apoiadas": {"type": "array", "items": {"type": "string"}},
+            "como_se_aplica": {"type": "string",
+                               "description": "raciocínio: como apoia (ou ameaça) cada tese."},
             "trechos_citaveis": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
                         "trecho": {"type": "string",
-                                   "description": "Citação LITERAL do acórdão."},
-                        "como_usar": {"type": "string",
-                                      "description": "Onde/como usar na defesa."},
+                                   "description": "cópia LITERAL de uma das passagens_verbatim."},
+                        "como_usar": {"type": "string"},
                     },
                     "required": ["trecho", "como_usar"],
                     "additionalProperties": False,
                 },
             },
-            "ressalvas": {
-                "type": "string",
-                "description": "Riscos de distinguishing, contexto fático diverso, ou "
-                               "string vazia se não houver.",
-            },
+            "ressalvas": {"type": "string",
+                          "description": "risco de distinguishing, ou string vazia."},
         },
-        "required": ["posicao", "aplicabilidade", "teses_apoiadas",
-                     "resumo_relevancia", "trechos_citaveis", "ressalvas"],
+        "required": ["posicao", "aplicabilidade", "teses_apoiadas", "como_se_aplica",
+                     "trechos_citaveis", "ressalvas"],
         "additionalProperties": False,
     },
 }
 
-SISTEMA_MODELO = """Você é um assistente jurídico especializado em direito de família \
-brasileiro e em jurisprudência do TJSC, auxiliando o advogado do AGRAVANTE no caso \
-abaixo. Sua tarefa é avaliar acórdãos do TJSC, um por vez, como possíveis precedentes \
-para a defesa.
+SIST_PERFIL = ("Você é assistente jurídico sênior em direito de família brasileiro e "
+               "jurisprudência do TJSC. Analise a peça do Agravante e destile um perfil "
+               "estruturado do caso (teses defendidas, fatos-chave, questões jurídicas e "
+               "termos de busca) que orientará a avaliação de acórdãos como precedentes. "
+               "Seja fiel à peça; não invente teses que ela não sustenta.")
 
-Critérios:
-- "favoravel" exige que a ratio decidendi (não um obiter dictum) apoie tese concreta \
-da defesa; um acórdão que nega o que o Agravante também pede é "contrario".
-- A aplicabilidade (0-10) pondera identidade fática: alimentos entre ex-cônjuges (sem \
-filhos), tutela provisória/cognição sumária, alimentante sócio de empresa, faturamento \
-bruto vs. pró-labore/renda efetiva, capacidade laborativa do credor, conduta indigna \
-(art. 1.708 do CC), empresa como terceiro não sujeito passivo.
-- "trechos_citaveis" devem ser citações LITERAIS do texto do acórdão fornecido; nunca \
-invente ou parafraseie dentro do campo "trecho".
-- Seja cético: na dúvida entre favoravel e neutro, prefira neutro e explique em \
-"ressalvas".
+SIST_EXTRACAO = ("Você resume acórdãos do TJSC com FIDELIDADE para um advogado de família. "
+                 "Leia o inteiro teor COMPLETO e extraia os elementos pedidos. Uma passagem "
+                 "só entra em passagens_verbatim se for cópia LITERAL do texto fornecido — "
+                 "nunca parafraseie nem invente. Marque relevante=true se a ratio decidendi "
+                 "tocar QUALQUER tese do caso (a favor ou contra); relevante=false para "
+                 "matéria diversa (ex.: alimentos a filhos menores, tema sem relação).\n\n"
+                 "=== PERFIL DO CASO ===\n{perfil}\n=== FIM DO PERFIL ===")
 
-=== PEÇA DO CASO (íntegra) ===
-{caso}
-=== FIM DA PEÇA DO CASO ==="""
+SIST_APLICACAO = ("Você é assistente jurídico do AGRAVANTE. A partir do perfil do caso e da "
+                  "extração de um acórdão (resumo fiel + passagens verbatim), avalie como o "
+                  "acórdão se aplica às teses da defesa. REGRAS: (1) 'favoravel' exige que a "
+                  "RATIO (não obiter) apoie tese concreta da defesa; um acórdão que nega o "
+                  "que o Agravante também pede é 'contrario'. (2) Em trechos_citaveis, copie "
+                  "LITERALMENTE apenas passagens presentes na lista passagens_verbatim — não "
+                  "crie novas citações. (3) Na dúvida entre favoravel e neutro, escolha neutro "
+                  "e explique em ressalvas.\n\n=== PERFIL DO CASO ===\n{perfil}\n=== FIM ===")
 
-INSTRUCAO_RELATORIO = """Com base na peça do caso (no contexto de sistema) e nas \
-análises estruturadas abaixo (uma por acórdão do TJSC), redija um RELATÓRIO DE \
-PRECEDENTES em markdown, em português, para uso do advogado do Agravante, contendo:
+SIST_SINTESE = ("Você é assistente jurídico do AGRAVANTE, redigindo um relatório de "
+                "precedentes a partir do perfil do caso e das análises (uma por acórdão).\n\n"
+                "=== PERFIL DO CASO ===\n{perfil}\n=== FIM DO PERFIL ===")
 
-1. **Sumário executivo** (3-6 parágrafos): força da jurisprudência local para cada \
-tese central do agravo, indicando onde a defesa está bem amparada e onde está exposta.
-2. **Precedentes favoráveis, organizados por tese**, do mais forte ao mais fraco, cada \
-um com: identificação completa, por que se aplica, o trecho citável mais forte, e um \
-parágrafo PRONTO PARA A MINUTA citando o precedente.
-3. **Precedentes contrários ou de risco**, cada um com estratégia objetiva de \
-distinguishing em relação ao caso concreto.
-4. **Lacunas**: teses do agravo sem respaldo na amostra analisada e o que buscar.
-
-Cite sempre no formato: (TJSC, <classe> n. <número>, rel. <relator>, <órgão julgador>, \
-j. <data>). Use apenas os acórdãos das análises abaixo; não invente precedentes.
-
-=== ANÁLISES ===
-{analises}"""
+INSTRUCAO_SINTESE = ("Redija, em markdown e português, um RELATÓRIO DE PRECEDENTES para o "
+                     "advogado do Agravante, com: 1) **Sumário executivo** por tese (onde a "
+                     "defesa está amparada e onde está exposta); 2) **Precedentes favoráveis, "
+                     "por tese**, do mais forte ao mais fraco — cada um com identificação "
+                     "completa, por que se aplica, o melhor trecho citável e um PARÁGRAFO "
+                     "PRONTO PARA A MINUTA; 3) **Precedentes contrários/de risco** com "
+                     "estratégia de distinguishing; 4) **Lacunas** (teses sem respaldo na "
+                     "amostra). Cite no formato (TJSC, <classe> n. <número>, rel. <relator>, "
+                     "<órgão>, j. <data>). Use somente os acórdãos abaixo; não invente.\n\n"
+                     "=== ANÁLISES ===\n{analises}")
 
 
-def recortar(texto, teto=TETO_CHARS_ACORDAO):
-    """Compacta espaços e, se necessário, corta o MIOLO do acórdão (ementa fica
-    no início e dispositivo no fim; o relatório intermediário é o sacrificável)."""
-    texto = re.sub(r"[ \t]+", " ", texto).strip()
-    if len(texto) <= teto:
-        return texto
-    inicio = int(teto * 0.75)
-    fim = teto - inicio
-    return (texto[:inicio] + "\n[... trecho intermediário omitido por limite de tamanho ...]\n"
-            + texto[-fim:])
+# ---------------------------------------------------------------- utilidades
 
+def sha256_texto(texto):
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def sha256_arquivo(caminho):
+    h = hashlib.sha256()
+    with open(caminho, "rb") as arq:
+        for bloco in iter(lambda: arq.read(65536), b""):
+            h.update(bloco)
+    return h.hexdigest()
+
+
+def texto_da_resposta(resposta):
+    return "".join(b.text for b in resposta.content if b.type == "text")
+
+
+def carregar_jsonl(caminho):
+    """dict doc_id -> registro (última ocorrência vence; tolera duplicatas)."""
+    registros = {}
+    if os.path.exists(caminho):
+        with open(caminho, encoding="utf-8") as arq:
+            for linha in arq:
+                linha = linha.strip()
+                if linha:
+                    reg = json.loads(linha)
+                    registros[reg["doc_id"]] = reg
+    return registros
+
+
+def compactar_jsonl(caminho, registros):
+    """Reescreve o arquivo só com os registros vivos (remove duplicatas/obsoletos)."""
+    tmp = caminho + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as arq:
+        for reg in registros.values():
+            arq.write(json.dumps(reg, ensure_ascii=False) + "\n")
+    os.replace(tmp, caminho)
+
+
+def carregar_json(caminho):
+    if os.path.exists(caminho):
+        with open(caminho, encoding="utf-8") as arq:
+            return json.load(arq)
+    return None
+
+
+def salvar_json(caminho, dados):
+    tmp = caminho + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as arq:
+        json.dump(dados, arq, ensure_ascii=False, indent=1)
+    os.replace(tmp, caminho)
+
+
+class Contador:
+    """Acumula uso de tokens por modelo e calcula o custo em dólar."""
+
+    def __init__(self):
+        self.por_modelo = collections.defaultdict(
+            lambda: {"entrada": 0, "saida": 0, "cache_escrita": 0, "cache_leitura": 0})
+
+    def somar(self, modelo, uso):
+        registro = self.por_modelo[modelo]
+        registro["entrada"] += uso.input_tokens
+        registro["saida"] += uso.output_tokens
+        registro["cache_escrita"] += getattr(uso, "cache_creation_input_tokens", 0) or 0
+        registro["cache_leitura"] += getattr(uso, "cache_read_input_tokens", 0) or 0
+
+    def custo(self):
+        total = 0.0
+        for modelo, u in self.por_modelo.items():
+            entrada, saida = PRECOS_USD.get(modelo, (5.0, 25.0))
+            total += (u["entrada"] * entrada + u["cache_escrita"] * entrada * 1.25
+                      + u["cache_leitura"] * entrada * 0.1 + u["saida"] * saida) / 1_000_000
+        return total
+
+
+def bloco_sistema(texto):
+    """Bloco de sistema com prompt caching (o perfil é reusado a ~0,1x do custo)."""
+    return [{"type": "text", "text": texto, "cache_control": {"type": "ephemeral"}}]
+
+
+def chamar(cliente, modelo, sistema, pergunta, contador, schema=None, pensar=True,
+           max_tokens=8000):
+    kwargs = {
+        "model": modelo, "max_tokens": max_tokens, "system": sistema,
+        "messages": [{"role": "user", "content": pergunta}],
+        "thinking": {"type": "adaptive"} if pensar else {"type": "disabled"},
+    }
+    if schema:
+        kwargs["output_config"] = {"format": schema}
+    resposta = cliente.messages.create(**kwargs)
+    contador.somar(modelo, resposta.usage)
+    return texto_da_resposta(resposta)
+
+
+# ---------------------------------------------------------------- estágios
+
+def gerar_perfil(cliente, texto_caso, modelo, contador):
+    texto = chamar(
+        cliente, modelo, bloco_sistema(SIST_PERFIL),
+        "Destile o perfil estruturado do caso a partir da peça abaixo.\n\n"
+        f"=== PEÇA DO CASO ===\n{texto_caso}\n=== FIM ===",
+        contador, schema=PERFIL_SCHEMA, pensar=True, max_tokens=MAX_TOKENS["perfil"])
+    return json.loads(texto)
+
+
+def extrair_acordao(cliente, sistema, linha, texto_acordao, modelo, contador):
+    if len(texto_acordao) > TETO_SEGURANCA_CHARS:
+        logging.warning("acórdão %s gigante (%s chars); enviando início para caber no contexto",
+                        linha["numero_processo"], len(texto_acordao))
+        texto_acordao = texto_acordao[:TETO_SEGURANCA_CHARS]
+    pergunta = (f"Acórdão — Processo {linha['numero_processo']} | Relator {linha['relator']} "
+                f"| {linha['orgao_julgador']} | j. {linha['data_julgamento']} | "
+                f"{linha['classe']}.\n\n=== INTEIRO TEOR (completo) ===\n{texto_acordao}")
+    # thinking desligado: extração é tarefa direta e queremos economia no modelo leve.
+    return json.loads(chamar(cliente, modelo, sistema, pergunta, contador,
+                             schema=EXTRACAO_SCHEMA, pensar=False,
+                             max_tokens=MAX_TOKENS["extracao"]))
+
+
+def analisar_aplicacao(cliente, sistema, linha, extracao, modelo, contador):
+    pergunta = (f"Acórdão — Processo {linha['numero_processo']} | Relator {linha['relator']} "
+                f"| {linha['orgao_julgador']} | j. {linha['data_julgamento']}.\n\n"
+                f"=== EXTRAÇÃO (resumo fiel + passagens verbatim) ===\n"
+                f"{json.dumps(extracao, ensure_ascii=False, indent=1)}")
+    return json.loads(chamar(cliente, modelo, sistema, pergunta, contador,
+                             schema=APLICACAO_SCHEMA, pensar=True,
+                             max_tokens=MAX_TOKENS["aplicacao"]))
+
+
+def sintetizar(cliente, sistema, analises, modelo, contador):
+    corpo = json.dumps(analises, ensure_ascii=False, indent=1)
+    return chamar(cliente, modelo, sistema,
+                  INSTRUCAO_SINTESE.format(analises=corpo), contador,
+                  pensar=True, max_tokens=MAX_TOKENS["sintese"])
+
+
+def montar_markdown(texto_sintese, aplicacoes, modelos):
+    """Monta o relatório em markdown (síntese da IA + apêndice com a tabela)."""
+    ordenadas = sorted(aplicacoes.values(),
+                       key=lambda r: (r["aplicacao"]["posicao"] != "favoravel",
+                                      -r["aplicacao"]["aplicabilidade"]))
+    linhas = [
+        "# Relatório de Precedentes — caso concreto × acórdãos TJSC",
+        f"> AVISO: relatório gerado por IA ({modelos}) a partir dos acórdãos baixados. "
+        "Apoio à decisão — confira cada precedente no inteiro teor antes de citar em juízo.",
+        "",
+        f"Gerado em: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} | "
+        f"Aplicações analisadas: {len(aplicacoes)}",
+        "",
+        texto_sintese.strip(),
+        "",
+        "---",
+        "",
+        "## Apêndice — análises (ordenadas por utilidade)",
+        "",
+        "| Processo | Posição | Aplic. | Relator | Data | Como se aplica |",
+        "|---|---|---|---|---|---|",
+    ]
+    for reg in ordenadas:
+        ap = reg["aplicacao"]
+        resumo = ap["como_se_aplica"].replace("|", "/").replace("\n", " ")[:200]
+        linhas.append(f"| {reg['numero_processo']} | {ap['posicao']} | "
+                      f"{ap['aplicabilidade']}/10 | {reg['relator']} | "
+                      f"{reg['data_julgamento']} | {resumo} |")
+    return "\n".join(linhas) + "\n"
+
+
+def escrever_md(caminho, markdown):
+    with open(caminho, "w", encoding="utf-8") as arq:
+        arq.write(markdown)
+
+
+_NEGRITO_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _runs_com_negrito(paragrafo, texto):
+    """Adiciona o texto ao parágrafo do Word convertendo **negrito** em runs."""
+    pos = 0
+    for m in _NEGRITO_RE.finditer(texto):
+        if m.start() > pos:
+            paragrafo.add_run(texto[pos:m.start()])
+        paragrafo.add_run(m.group(1)).bold = True
+        pos = m.end()
+    if pos < len(texto):
+        paragrafo.add_run(texto[pos:])
+
+
+def escrever_docx(caminho, markdown):
+    """Converte o relatório markdown em um .docx formatado (mesma engine da skill
+    docx). Sem dependência: se python-docx faltar, retorna False e segue só com .md."""
+    try:
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+    except ImportError:
+        return False
+
+    documento = Document()
+    estilo = documento.styles["Normal"]
+    estilo.font.name = "Calibri"
+    estilo.font.size = Pt(11)
+
+    linhas = markdown.splitlines()
+    indice = 0
+    while indice < len(linhas):
+        linha = linhas[indice].rstrip()
+        if not linha.strip():
+            indice += 1
+            continue
+        # Tabela markdown: acumula linhas iniciadas por "|"
+        if linha.lstrip().startswith("|"):
+            bloco = []
+            while indice < len(linhas) and linhas[indice].lstrip().startswith("|"):
+                bloco.append(linhas[indice].strip())
+                indice += 1
+            linhas_dados = [l for l in bloco if not re.match(r"^\|[\s:|-]+\|$", l)]
+            celulas = [[c.strip() for c in l.strip("|").split("|")] for l in linhas_dados]
+            if celulas:
+                tabela = documento.add_table(rows=1, cols=len(celulas[0]))
+                try:
+                    tabela.style = "Light Grid Accent 1"
+                except KeyError:
+                    tabela.style = "Table Grid"
+                for idx, texto in enumerate(celulas[0]):
+                    run = tabela.rows[0].cells[idx].paragraphs[0].add_run(texto)
+                    run.bold = True
+                for linha_dados in celulas[1:]:
+                    cels = tabela.add_row().cells
+                    for idx, texto in enumerate(linha_dados[:len(celulas[0])]):
+                        cels[idx].text = texto
+            continue
+        if linha.startswith("# "):
+            documento.add_heading(linha[2:].strip(), level=0)
+        elif linha.startswith("## "):
+            documento.add_heading(linha[3:].strip(), level=1)
+        elif linha.startswith("### "):
+            documento.add_heading(linha[4:].strip(), level=2)
+        elif linha.startswith("#### "):
+            documento.add_heading(linha[5:].strip(), level=3)
+        elif linha.startswith(">"):
+            paragrafo = documento.add_paragraph(style="Intense Quote")
+            _runs_com_negrito(paragrafo, linha.lstrip("> ").strip())
+        elif linha.strip() == "---":
+            documento.add_paragraph()
+        elif re.match(r"^\s*[-*]\s+", linha):
+            paragrafo = documento.add_paragraph(style="List Bullet")
+            _runs_com_negrito(paragrafo, re.sub(r"^\s*[-*]\s+", "", linha))
+        elif re.match(r"^\s*\d+\.\s+", linha):
+            paragrafo = documento.add_paragraph(style="List Number")
+            _runs_com_negrito(paragrafo, re.sub(r"^\s*\d+\.\s+", "", linha))
+        else:
+            _runs_com_negrito(documento.add_paragraph(), linha)
+        indice += 1
+    documento.save(caminho)
+    return True
+
+
+# ---------------------------------------------------------------- orquestração
 
 def carregar_indice(saida):
     caminho = os.path.join(saida, "index.csv")
     if not os.path.exists(caminho):
         sys.exit(f"{caminho} não encontrado — rode antes o scraper_tjsc.py (com download).")
     with open(caminho, newline="", encoding="utf-8") as arq:
-        linhas = [l for l in csv.DictReader(arq) if l.get("doc_id")]
-    # Com triagem disponível, analisa primeiro os mais promissores (útil com --limite)
+        linhas = [l for l in csv.DictReader(arq) if l.get("doc_id") and l.get("arquivo")]
     caminho_triagem = os.path.join(saida, "triagem.csv")
-    if os.path.exists(caminho_triagem):
+    if os.path.exists(caminho_triagem):  # prioriza os mais promissores (útil com --limite)
         with open(caminho_triagem, newline="", encoding="utf-8") as arq:
             notas = {}
             for linha in csv.DictReader(arq):
@@ -184,200 +484,214 @@ def carregar_indice(saida):
     return linhas
 
 
-def carregar_analises(caminho_jsonl):
-    analises = {}
-    if os.path.exists(caminho_jsonl):
-        with open(caminho_jsonl, encoding="utf-8") as arq:
-            for linha in arq:
-                linha = linha.strip()
-                if linha:
-                    registro = json.loads(linha)
-                    analises[registro["doc_id"]] = registro
-    return analises
-
-
-def texto_da_resposta(resposta):
-    return "".join(bloco.text for bloco in resposta.content if bloco.type == "text")
-
-
-def somar_uso(total, uso):
-    total["entrada"] += uso.input_tokens
-    total["saida"] += uso.output_tokens
-    total["cache_escrita"] += getattr(uso, "cache_creation_input_tokens", 0) or 0
-    total["cache_leitura"] += getattr(uso, "cache_read_input_tokens", 0) or 0
-
-
-def custo_usd(total, modelo):
-    preco_in, preco_out = PRECOS_USD.get(modelo, (5.0, 25.0))
-    return (total["entrada"] * preco_in + total["cache_escrita"] * preco_in * 1.25
-            + total["cache_leitura"] * preco_in * 0.1
-            + total["saida"] * preco_out) / 1_000_000
-
-
-def gerar_relatorio_md(caminho, texto_sintese, analises, modelo):
-    import datetime
-    ordenadas = sorted(analises.values(),
-                       key=lambda r: (r["analise"]["posicao"] != "favoravel",
-                                      -r["analise"]["aplicabilidade"]))
-    linhas = [
-        "# Relatório de Precedentes — caso concreto × acórdãos TJSC",
-        "> AVISO: relatório gerado por IA (modelo "
-        f"{modelo}) a partir dos acórdãos baixados. Ferramenta de apoio — confira cada "
-        "precedente no inteiro teor antes de citar em juízo.",
-        "",
-        f"Gerado em: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')} | "
-        f"Acórdãos analisados: {len(analises)}",
-        "",
-        texto_sintese.strip(),
-        "",
-        "---",
-        "",
-        "## Apêndice — todas as análises (ordenadas por utilidade)",
-        "",
-        "| Processo | Posição | Aplic. | Relator | Data | Resumo |",
-        "|---|---|---|---|---|---|",
-    ]
-    for registro in ordenadas:
-        analise = registro["analise"]
-        resumo = analise["resumo_relevancia"].replace("|", "/").replace("\n", " ")
-        linhas.append(f"| {registro['numero_processo']} | {analise['posicao']} | "
-                      f"{analise['aplicabilidade']}/10 | {registro['relator']} | "
-                      f"{registro['data_julgamento']} | {resumo} |")
-    linhas.append("")
-    with open(caminho, "w", encoding="utf-8") as arq:
-        arq.write("\n".join(linhas))
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Avalia os acórdãos baixados como precedentes para um caso concreto "
-                    "(API do Claude) e gera relatorio_caso.md.")
+        description="Pipeline de 4 estágios (perfil/extração/aplicação/síntese) que avalia "
+                    "os acórdãos baixados como precedentes para um caso concreto.")
     parser.add_argument("--caso", required=True,
-                        help="arquivo com a peça do caso (md/txt) — fica fora do repositório")
-    parser.add_argument("--out", default=OUT_PADRAO,
-                        help=f"pasta de saída do scraper (padrão: {OUT_PADRAO})")
+                        help="peça do caso (md/txt), fora do repositório")
+    parser.add_argument("--out", default=OUT_PADRAO, help=f"pasta do scraper (padrão: {OUT_PADRAO})")
     parser.add_argument("--limite", type=int, default=0,
-                        help="analisa no máximo N acórdãos novos (0 = todos); comece com 5")
-    parser.add_argument("--modelo", default=MODELO_PADRAO,
-                        help=f"modelo da API (padrão: {MODELO_PADRAO})")
+                        help="extrai no máximo N acórdãos NOVOS nesta execução (0 = todos)")
+    parser.add_argument("--modelo-pesado", default=MODELO_PESADO,
+                        help=f"modelo de raciocínio (padrão: {MODELO_PESADO})")
+    parser.add_argument("--modelo-leve", default=MODELO_LEVE,
+                        help=f"modelo de extração (padrão: {MODELO_LEVE})")
+    parser.add_argument("--forcar-relatorio", action="store_true",
+                        help="regenera o relatório a partir do cache mesmo sem novidades")
+    parser.add_argument("--sem-docx", action="store_true",
+                        help="gera apenas o .md, sem o .docx formatado (requer python-docx)")
     parser.add_argument("--refazer", action="store_true",
-                        help="ignora o cache e re-analisa todos os acórdãos (re-cobra!)")
+                        help="ignora TODO o cache e refaz perfil, extrações e análises (re-cobra!)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", force=True)
     if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        sys.exit("Defina a variável de ambiente ANTHROPIC_API_KEY antes de rodar "
-                 '(ex.: export ANTHROPIC_API_KEY="sk-ant-...").')
+        sys.exit('Defina ANTHROPIC_API_KEY antes de rodar (export ANTHROPIC_API_KEY="sk-ant-...").')
 
     with open(args.caso, encoding="utf-8") as arq:
         texto_caso = arq.read()
-    sistema = [{
-        "type": "text",
-        "text": SISTEMA_MODELO.format(caso=texto_caso),
-        "cache_control": {"type": "ephemeral"},  # peça do caso paga ~1x e reusa a ~0,1x
-    }]
-    logging.info("peça do caso: %s (~%s mil caracteres) | modelo: %s",
-                 args.caso, len(texto_caso) // 1000, args.modelo)
+    hash_agravo = sha256_texto(texto_caso)
 
-    caminho_jsonl = os.path.join(args.out, "analises_caso.jsonl")
-    if args.refazer and os.path.exists(caminho_jsonl):
-        os.remove(caminho_jsonl)
-    analises = carregar_analises(caminho_jsonl)
+    p_perfil = os.path.join(args.out, "perfil_caso.json")
+    p_extr = os.path.join(args.out, "extracoes_caso.jsonl")
+    p_apli = os.path.join(args.out, "aplicacoes_caso.jsonl")
+    p_estado = os.path.join(args.out, "relatorio_estado.json")
+    p_md = os.path.join(args.out, "relatorio_caso.md")
+    p_docx = os.path.join(args.out, "relatorio_caso.docx")
+    if args.refazer:
+        for caminho in (p_perfil, p_extr, p_apli, p_estado):
+            if os.path.exists(caminho):
+                os.remove(caminho)
+
+    # --- estado em disco (sem tocar na API ainda) ---
+    perfil_meta = carregar_json(p_perfil)
+    precisa_perfil = (perfil_meta is None or perfil_meta.get("hash_agravo") != hash_agravo)
+    extracoes = carregar_jsonl(p_extr)
+    aplicacoes_todas = carregar_jsonl(p_apli)
+    # aplicações só valem para o agravo atual (se o agravo mudou, são refeitas)
+    aplicacoes = {k: v for k, v in aplicacoes_todas.items()
+                  if v.get("hash_agravo") == hash_agravo}
+
     documentos = carregar_indice(args.out)
-    pendentes = [l for l in documentos if l["doc_id"] not in analises and l.get("arquivo")]
-    if args.limite > 0:
-        pendentes = pendentes[:args.limite]
-    logging.info("documentos no catálogo: %s | já analisados: %s | a analisar agora: %s",
-                 len(documentos), len(analises), len(pendentes))
+    hashes = {}  # doc_id -> hash do arquivo atual (re-extrai se o arquivo mudou)
+    presentes = []
+    for linha in documentos:
+        caminho = os.path.join(args.out, linha["arquivo"])
+        if os.path.exists(caminho):
+            hashes[linha["doc_id"]] = sha256_arquivo(caminho)
+            presentes.append(linha)
+
+    def extracao_valida(doc_id):
+        reg = extracoes.get(doc_id)
+        return reg is not None and reg.get("hash_arquivo") == hashes.get(doc_id)
+
+    def eh_relevante(doc_id):
+        reg = extracoes.get(doc_id)
+        return bool(reg and reg["extracao"].get("relevante"))
+
+    pend_extracao = [l for l in presentes if not extracao_valida(l["doc_id"])]
+    relevantes = [l for l in presentes if extracao_valida(l["doc_id"]) and eh_relevante(l["doc_id"])]
+    pend_aplicacao = [l for l in relevantes if l["doc_id"] not in aplicacoes]
+    ids_relevantes = sorted(l["doc_id"] for l in relevantes)
+    estado = carregar_json(p_estado)
+    relatorio_ok = (os.path.exists(p_md) and estado is not None
+                    and estado.get("hash_agravo") == hash_agravo
+                    and estado.get("ids_relevantes") == ids_relevantes)
+
+    if (not precisa_perfil and not pend_extracao and not pend_aplicacao
+            and relatorio_ok and not args.forcar_relatorio):
+        logging.info("Nada novo: agravo inalterado e nenhum acórdão novo no index.csv.")
+        print("Nada a fazer — o relatório já está atualizado (nenhuma chamada à API). "
+              f"Veja {p_md}")
+        return
 
     cliente = anthropic.Anthropic(max_retries=4)
-    uso_total = {"entrada": 0, "saida": 0, "cache_escrita": 0, "cache_leitura": 0}
-    falhas = 0
-    interrompido = False
-    with open(caminho_jsonl, "a", encoding="utf-8") as arq_jsonl:
-        for indice, linha in enumerate(pendentes, 1):
+    contador = Contador()
+    estagios = collections.Counter()
+    if args.limite > 0:
+        pend_extracao = pend_extracao[:args.limite]
+    logging.info("agravo %s | perfil %s | extrações novas: %s | aplicações pendentes: %s",
+                 "alterado/novo" if precisa_perfil else "em cache",
+                 "regerar" if precisa_perfil else "ok", len(pend_extracao), len(pend_aplicacao))
+
+    try:
+        # 1) PERFIL (Opus) — uma vez; reusa do disco se o agravo não mudou
+        if precisa_perfil:
+            logging.info("gerando perfil do caso (%s)...", args.modelo_pesado)
+            perfil = gerar_perfil(cliente, texto_caso, args.modelo_pesado, contador)
+            salvar_json(p_perfil, {"hash_agravo": hash_agravo, "modelo": args.modelo_pesado,
+                                   "gerado_em": datetime.datetime.now().isoformat(timespec="seconds"),
+                                   "perfil": perfil})
+            estagios["perfil"] += 1
+            aplicacoes = {}  # agravo mudou -> análises antigas não valem mais
+        else:
+            perfil = perfil_meta["perfil"]
+        perfil_str = json.dumps(perfil, ensure_ascii=False, indent=1)
+        sist_extr = bloco_sistema(SIST_EXTRACAO.format(perfil=perfil_str))
+        sist_apli = bloco_sistema(SIST_APLICACAO.format(perfil=perfil_str))
+
+        # 2) EXTRAÇÃO (Sonnet) — lê o acórdão COMPLETO, só os novos/alterados
+        for indice, linha in enumerate(pend_extracao, 1):
             rotulo = linha["numero_processo"] or linha["doc_id"]
             try:
-                caminho_doc = os.path.join(args.out, linha["arquivo"])
-                if not os.path.exists(caminho_doc):
-                    logging.warning("[%s/%s] %s: arquivo ausente, pulando (rode o "
-                                    "scraper sem --dry-run)", indice, len(pendentes), rotulo)
-                    continue
-                texto = triagem_tjsc.extrair_texto(caminho_doc)
+                texto = triagem_tjsc.extrair_texto(os.path.join(args.out, linha["arquivo"]))
                 if len(texto.strip()) < MIN_CHARS_TEXTO:
-                    logging.warning("[%s/%s] %s: sem texto extraível, pulando",
-                                    indice, len(pendentes), rotulo)
+                    logging.warning("[extração %s/%s] %s: sem texto extraível, pulando",
+                                    indice, len(pend_extracao), rotulo)
                     continue
-                pergunta = (
-                    "Analise o acórdão abaixo como possível precedente para a defesa "
-                    "do Agravante no caso do contexto de sistema.\n\n"
-                    f"Processo: {linha['numero_processo']} | Relator: {linha['relator']} | "
-                    f"Órgão julgador: {linha['orgao_julgador']} | "
-                    f"Julgado em: {linha['data_julgamento']} | Classe: {linha['classe']}\n\n"
-                    f"=== INTEIRO TEOR ===\n{recortar(texto)}")
-                resposta = cliente.messages.create(
-                    model=args.modelo,
-                    max_tokens=MAX_TOKENS_ANALISE,
-                    thinking={"type": "adaptive"},
-                    system=sistema,
-                    messages=[{"role": "user", "content": pergunta}],
-                    output_config={"format": ESQUEMA_ANALISE},
-                )
-                analise = json.loads(texto_da_resposta(resposta))
-                somar_uso(uso_total, resposta.usage)
+                extracao = extrair_acordao(cliente, sist_extr, linha, texto,
+                                           args.modelo_leve, contador)
                 registro = {chave: linha.get(chave, "") for chave in
                             ("doc_id", "numero_processo", "relator", "camara",
                              "orgao_julgador", "data_julgamento", "classe", "arquivo")}
-                registro["analise"] = analise
-                arq_jsonl.write(json.dumps(registro, ensure_ascii=False) + "\n")
-                arq_jsonl.flush()
-                analises[linha["doc_id"]] = registro
-                logging.info("[%s/%s] %s -> %s (%s/10) | custo acumulado ~US$ %.2f",
-                             indice, len(pendentes), rotulo, analise["posicao"],
-                             analise["aplicabilidade"], custo_usd(uso_total, args.modelo))
-            except anthropic.AuthenticationError:
-                sys.exit("Chave de API inválida/revogada (401). Gere uma nova em "
-                         "console.anthropic.com e exporte ANTHROPIC_API_KEY.")
-            except KeyboardInterrupt:
-                logging.warning("interrompido; o que já foi analisado está salvo em %s",
-                                caminho_jsonl)
-                interrompido = True
-                break
+                registro.update(hash_arquivo=hashes[linha["doc_id"]], extracao=extracao)
+                extracoes[linha["doc_id"]] = registro
+                estagios["extracao"] += 1
+                logging.info("[extração %s/%s] %s -> relevante=%s (%s) | ~US$ %.2f",
+                             indice, len(pend_extracao), rotulo, extracao["relevante"],
+                             extracao["posicao_preliminar"], contador.custo())
             except Exception as exc:
-                falhas += 1
-                logging.error("[%s/%s] %s: %s", indice, len(pendentes), rotulo, exc)
+                estagios["falhas"] += 1
+                logging.error("[extração] %s: %s", rotulo, exc)
+        compactar_jsonl(p_extr, extracoes)
 
-    if not analises:
-        sys.exit("Nenhuma análise disponível — nada para sintetizar.")
+        # recomputa relevantes/pendentes após as novas extrações
+        relevantes = [l for l in presentes
+                      if extracao_valida(l["doc_id"]) and eh_relevante(l["doc_id"])]
+        pend_aplicacao = [l for l in relevantes if l["doc_id"] not in aplicacoes]
 
-    favoraveis = sorted((r for r in analises.values()
-                         if r["analise"]["posicao"] == "favoravel"),
-                        key=lambda r: -r["analise"]["aplicabilidade"])[:TOP_FAVORAVEIS]
-    contrarios = [r for r in analises.values() if r["analise"]["posicao"] == "contrario"]
-    logging.info("síntese: %s favoráveis (top %s) e %s contrários de %s análises",
-                 len(favoraveis), TOP_FAVORAVEIS, len(contrarios), len(analises))
-    corpo = json.dumps({"favoraveis": favoraveis, "contrarios_ou_risco": contrarios},
-                       ensure_ascii=False, indent=1)
-    resposta = cliente.messages.create(
-        model=args.modelo,
-        max_tokens=MAX_TOKENS_RELATORIO,
-        thinking={"type": "adaptive"},
-        system=sistema,
-        messages=[{"role": "user", "content": INSTRUCAO_RELATORIO.format(analises=corpo)}],
-    )
-    somar_uso(uso_total, resposta.usage)
-    caminho_md = os.path.join(args.out, "relatorio_caso.md")
-    gerar_relatorio_md(caminho_md, texto_da_resposta(resposta), analises, args.modelo)
+        # 3) APLICAÇÃO (Opus) — só nos relevantes ainda sem análise para este agravo
+        for indice, linha in enumerate(pend_aplicacao, 1):
+            rotulo = linha["numero_processo"] or linha["doc_id"]
+            try:
+                extracao = extracoes[linha["doc_id"]]["extracao"]
+                aplicacao = analisar_aplicacao(cliente, sist_apli, linha, extracao,
+                                               args.modelo_pesado, contador)
+                registro = {chave: linha.get(chave, "") for chave in
+                            ("doc_id", "numero_processo", "relator", "camara",
+                             "orgao_julgador", "data_julgamento", "classe", "arquivo")}
+                registro.update(hash_agravo=hash_agravo, aplicacao=aplicacao)
+                aplicacoes[linha["doc_id"]] = registro
+                estagios["aplicacao"] += 1
+                logging.info("[aplicação %s/%s] %s -> %s (%s/10) | ~US$ %.2f",
+                             indice, len(pend_aplicacao), rotulo, aplicacao["posicao"],
+                             aplicacao["aplicabilidade"], contador.custo())
+            except Exception as exc:
+                estagios["falhas"] += 1
+                logging.error("[aplicação] %s: %s", rotulo, exc)
+        compactar_jsonl(p_apli, aplicacoes)
+    except anthropic.AuthenticationError:
+        sys.exit("Chave de API inválida/revogada (401). Gere uma nova e exporte ANTHROPIC_API_KEY.")
+    except KeyboardInterrupt:
+        compactar_jsonl(p_extr, extracoes)
+        compactar_jsonl(p_apli, aplicacoes)
+        logging.warning("interrompido; progresso salvo. Reexecute para continuar.")
+        sys.exit(130)
 
-    custo = custo_usd(uso_total, args.modelo)
-    print(f"\nConcluído{' (parcial: interrompido)' if interrompido else ''}. "
-          f"análises={len(analises)} | favoráveis={sum(1 for r in analises.values() if r['analise']['posicao'] == 'favoravel')} | "
-          f"contrários={len(contrarios)} | falhas={falhas}")
-    print(f"Tokens: entrada={uso_total['entrada']:,} | cache_escrita={uso_total['cache_escrita']:,} | "
-          f"cache_leitura={uso_total['cache_leitura']:,} | saída={uso_total['saida']:,} "
-          f"| custo estimado ~US$ {custo:.2f}")
-    print(f"Relatório: {caminho_md}\nAnálises: {caminho_jsonl}")
+    # 4) SÍNTESE (Opus) — só se houve novidade ou o relatório está desatualizado
+    ids_relevantes = sorted(l["doc_id"] for l in relevantes)
+    precisa_sintese = (estagios["aplicacao"] > 0 or precisa_perfil or not os.path.exists(p_md)
+                       or args.forcar_relatorio
+                       or (estado or {}).get("ids_relevantes") != ids_relevantes)
+    if precisa_sintese and aplicacoes:
+        sist_sint = bloco_sistema(SIST_SINTESE.format(
+            perfil=json.dumps(perfil, ensure_ascii=False, indent=1)))
+        favoraveis = sorted((r for r in aplicacoes.values()
+                             if r["aplicacao"]["posicao"] == "favoravel"),
+                            key=lambda r: -r["aplicacao"]["aplicabilidade"])[:TOP_FAVORAVEIS]
+        contrarios = [r for r in aplicacoes.values()
+                      if r["aplicacao"]["posicao"] == "contrario"]
+        logging.info("sintetizando relatório (%s favoráveis, %s contrários)...",
+                     len(favoraveis), len(contrarios))
+        texto_sintese = sintetizar(cliente, sist_sint,
+                                   {"favoraveis": favoraveis, "contrarios_ou_risco": contrarios},
+                                   args.modelo_pesado, contador)
+        markdown = montar_markdown(texto_sintese, aplicacoes,
+                                   f"{args.modelo_pesado} + {args.modelo_leve}")
+        escrever_md(p_md, markdown)
+        if not args.sem_docx and not escrever_docx(p_docx, markdown):
+            logging.warning("python-docx ausente — gerei só o .md (pip install python-docx "
+                            "para o .docx formatado).")
+        salvar_json(p_estado, {"hash_agravo": hash_agravo, "ids_relevantes": ids_relevantes,
+                               "gerado_em": datetime.datetime.now().isoformat(timespec="seconds")})
+        estagios["sintese"] += 1
+    elif not aplicacoes:
+        logging.warning("nenhuma aplicação disponível — relatório não gerado.")
+
+    favs = sum(1 for r in aplicacoes.values() if r["aplicacao"]["posicao"] == "favoravel")
+    contras = sum(1 for r in aplicacoes.values() if r["aplicacao"]["posicao"] == "contrario")
+    print(f"\nConcluído. perfil={estagios['perfil']} | extrações novas={estagios['extracao']} "
+          f"| aplicações novas={estagios['aplicacao']} | sínteses={estagios['sintese']} "
+          f"| falhas={estagios['falhas']}")
+    print(f"Acervo analisado: {len(aplicacoes)} aplicações ({favs} favoráveis, {contras} contrários) "
+          f"| relevantes={len(relevantes)} de {len(presentes)} acórdãos")
+    detalhe = " | ".join(
+        f"{m}: in={u['entrada']:,} cw={u['cache_escrita']:,} cr={u['cache_leitura']:,} out={u['saida']:,}"
+        for m, u in contador.por_modelo.items())
+    print(f"Tokens [{detalhe or 'nenhuma chamada'}] | custo estimado ~US$ {contador.custo():.2f}")
+    print(f"Relatório: {p_md}" + (f" e {p_docx}" if os.path.exists(p_docx) else ""))
 
 
 if __name__ == "__main__":
