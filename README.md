@@ -66,12 +66,52 @@ intervalo mínimo de **2 s entre todas as requisições** (sem paralelismo) e
 faz backoff exponencial em HTTP 429/5xx. Confira também os Termos de Uso do
 portal antes de operar em escala.
 
+## Triagem (pós-processamento)
+
+Depois de baixar os documentos, o `triagem_tjsc.py` lê o texto de cada arquivo
+(`.pdf`, `.rtf` e `.html`), pontua termos da tese jurídica em dois eixos
+(prova/cognição sumária e binômio/capacidade contributiva) e classifica cada
+decisão como FAVORÁVEL / CONTRÁRIA / NEUTRA por eixo. É 100% offline e
+sobrescreve seus dois artefatos a cada execução:
+
+- `decisoes_tjsc/triagem.csv` — uma linha por documento, com scores e termos;
+- `decisoes_tjsc/relatorio_triagem.md` — relatório de leitura priorizada, com
+  a seção **ALERTA** (precedentes potencialmente contrários) no topo e
+  snippets do texto original que dispararam cada classificação.
+
+```bash
+python triagem_tjsc.py              # processa decisoes_tjsc/
+python triagem_tjsc.py --out DIR    # outra pasta de saída
+python triagem_tjsc.py --ocr        # tenta OCR em PDFs escaneados
+                                    # (requer pytesseract + pdf2image)
+```
+
+> AVISO: é classificação automática por palavra-chave — prioriza a leitura,
+> não substitui a análise jurídica. Um acórdão pode citar um termo justamente
+> para afastá-lo; a seção ALERTA existe para leitura prioritária, não descarte.
+
+PDFs sem texto extraível são marcados `precisa_ocr` e listados no apêndice do
+relatório — nunca classificados como neutros por omissão. Dicionários de
+termos, pesos e limiares ficam no topo de `triagem_tjsc.py`; ajustar um peso
+muda a classificação sem nenhuma outra alteração de código.
+
+### Sequência completa do fluxo
+
+```bash
+pip install -r requirements.txt
+python scraper_tjsc.py --dry-run    # 1. busca e cataloga (confira o index.csv)
+python scraper_tjsc.py              # 2. baixa os inteiros teores
+python triagem_tjsc.py              # 3. classifica e gera o relatório
+open decisoes_tjsc/relatorio_triagem.md
+```
+
 ## Testes
 
 Suíte offline contra um portal falso local (não toca a internet):
 
 ```bash
 python test_scraper_tjsc.py -v
+python test_triagem_tjsc.py -v
 ```
 
 Cobre: parsing dos rótulos do portal (com entidades HTML), paginação,

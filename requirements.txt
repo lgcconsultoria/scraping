@@ -1,1 +1,8 @@
+# scraper (coleta)
 requests>=2.25
+
+# triagem (pós-processamento offline dos documentos baixados)
+pdfplumber>=0.10
+pypdf>=3.9
+beautifulsoup4>=4.11
+striprtf>=0.0.26
