@@ -95,14 +95,40 @@ relatório — nunca classificados como neutros por omissão. Dicionários de
 termos, pesos e limiares ficam no topo de `triagem_tjsc.py`; ajustar um peso
 muda a classificação sem nenhuma outra alteração de código.
 
+## Relatório do caso (API do Claude)
+
+O `relatorio_caso_tjsc.py` cruza uma peça do SEU caso (ex.: o agravo de
+instrumento, em md/txt) com os acórdãos baixados: o Claude avalia cada acórdão
+como precedente para a defesa (favorável/contrário/neutro + aplicabilidade
+0-10 + trechos citáveis, em JSON estruturado) e, ao final, redige um relatório
+de precedentes organizado por tese, com parágrafos prontos para a minuta e
+estratégias de distinguishing para os precedentes de risco.
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."    # chave SÓ via variável de ambiente
+python relatorio_caso_tjsc.py --caso minha_peca.md --limite 5   # teste barato
+python relatorio_caso_tjsc.py --caso minha_peca.md              # análise completa
+python relatorio_caso_tjsc.py --caso minha_peca.md --modelo claude-sonnet-4-6  # mais barato
+```
+
+Saídas: `decisoes_tjsc/analises_caso.jsonl` (cache retomável — reexecutar não
+re-analisa nem re-cobra o que já foi feito) e `decisoes_tjsc/relatorio_caso.md`.
+A peça do caso entra como contexto com prompt caching (custo ~10x menor nas
+chamadas seguintes) e NÃO deve ser commitada no repositório.
+
+> SEGURANÇA: nunca grave a chave de API em código, arquivo versionado ou chat.
+> Use somente a variável de ambiente `ANTHROPIC_API_KEY`. Se uma chave vazar,
+> revogue-a imediatamente em console.anthropic.com.
+
 ### Sequência completa do fluxo
 
 ```bash
 pip install -r requirements.txt
 python scraper_tjsc.py --dry-run    # 1. busca e cataloga (confira o index.csv)
 python scraper_tjsc.py              # 2. baixa os inteiros teores
-python triagem_tjsc.py              # 3. classifica e gera o relatório
-open decisoes_tjsc/relatorio_triagem.md
+python triagem_tjsc.py              # 3. classifica e gera o relatório de triagem
+python relatorio_caso_tjsc.py --caso minha_peca.md --limite 5  # 4. cruza com o caso
+open decisoes_tjsc/relatorio_caso.md
 ```
 
 ## Testes
