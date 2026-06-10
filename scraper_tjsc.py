@@ -48,7 +48,7 @@ import sys
 import time
 import unicodedata
 import urllib.robotparser
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 
 try:
     import requests
@@ -106,7 +106,12 @@ COLUNAS = [
 ]
 
 ID_RE = re.compile(r"(?:rowid|id)=(\d{30})")
-TOTAL_RE = re.compile(r"([\d.,]+)\s+resultados?\s+encontrados?", re.I)
+# Link real do inteiro teor nos resultados: abreIntegra('pos','<id>','<tipo>',...)
+# id = ROWID alfanumérico (acordao/acordao_5) ou numérico de 30 dígitos (eproc).
+ABRE_INTEGRA_RE = re.compile(r"abreIntegra\(\s*'[^']*'\s*,\s*'([^']+)'\s*,\s*'([^']*)'", re.I)
+# O total vem com markup no meio do texto: <b>20</b> resultados encontrados
+TOTAL_RE = re.compile(r"([\d.,]+)\s*(?:<[^>]*>\s*)*resultados?\s+encontrados?", re.I)
+COMENTARIO_RE = re.compile(r"<!--.*?-->", re.S)
 TAG_RE = re.compile(r"<[^>]+>")
 HREF_RE = re.compile(r"""(?:href|src)\s*=\s*["']([^"']+)["']""", re.I)
 SPLIT_PROCESSO_RE = re.compile(r"Processo\s*:")
@@ -115,7 +120,8 @@ NUM_ANTIGO_RE = re.compile(r"\b\d{4}\.\d{6}-?\d\b")
 # Rótulos que delimitam o fim do valor de um campo no texto do resultado.
 ROTULO_ALT = (
     r"(?:Processo|Relator(?:a|\s*\(a\))?(?:\s+Designad[oa])?|Origem|"
-    r"[OÓ]rg[aã]o\s+Julgador|Julgado\s+em|Classe|Decis[aã]o|Ementa|Juiz(?:a)?)"
+    r"[OÓ]rg[aã]o\s+Julgador|Julgado\s+em|Classe|Decis[aã]o|Ementa|"
+    r"Juiz(?:a)?(?:\s+Prolator(?:a)?)?)"
 )
 
 
@@ -129,12 +135,18 @@ def sanitizar_nome(nome):
     return re.sub(r"[^\w.\-]+", "_", nome).strip("._-")[:150]
 
 
-def url_integra(doc_id):
-    return f"{BASE}/integra.do?rowid={doc_id}&tipo=acordao_eproc"
+def url_integra(doc_id, tipo="acordao_eproc"):
+    return f"{BASE}/integra.do?rowid={quote(doc_id, safe='')}&tipo={quote(tipo, safe='')}"
 
 
-def url_html(doc_id):
-    return f"{BASE}/html.do?id={doc_id}&categoria=acordao_eproc"
+def url_html(doc_id, tipo="acordao_eproc"):
+    return f"{BASE}/html.do?id={quote(doc_id, safe='')}&categoria={quote(tipo, safe='')}"
+
+
+def tipo_do_documento(linha):
+    """Recupera o tipo (acordao, acordao_5, acordao_eproc...) da URL catalogada."""
+    m = re.search(r"[?&](?:tipo|categoria)=([^&]+)", linha.get("url_integra", ""))
+    return unquote(m.group(1)) if m else "acordao_eproc"
 
 
 class ClienteHttp:
@@ -240,22 +252,48 @@ def extrair_numero(texto_limpo):
     return m.group(0) if m else ""
 
 
+MESES_EN = {"jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05",
+            "jun": "06", "jul": "07", "aug": "08", "sep": "09", "oct": "10",
+            "nov": "11", "dec": "12"}
+
+
+def normalizar_data(valor):
+    """Converte a data Java do portal ("Thu Aug 27 00:00:00 GMT-03:00 2020")
+    para dd/mm/aaaa; outros formatos passam adiante sem alteração."""
+    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{4})\b", valor)
+    if m:
+        return m.group(1)
+    m = re.match(r"[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+[\d:]+\s+\S+\s+(\d{4})", valor)
+    if m and m.group(1).lower() in MESES_EN:
+        return f"{int(m.group(2)):02d}/{MESES_EN[m.group(1).lower()]}/{m.group(3)}"
+    return valor
+
+
 def parse_resultados(html_pagina):
-    """Retorna (registros, total). O portal repete rótulos textuais por registro."""
+    """Retorna (registros, total). Cada resultado repete rótulos textuais e traz
+    o id/tipo do documento na chamada JS abreIntegra do botão "Inteiro Teor"."""
+    # Comentários HTML duplicam o rótulo "Processo:" em cada resultado.
+    html_pagina = COMENTARIO_RE.sub(" ", html_pagina)
     m_total = TOTAL_RE.search(html_pagina)
     total = int(re.sub(r"\D", "", m_total.group(1))) if m_total else 0
     registros = []
     for bloco in SPLIT_PROCESSO_RE.split(html_pagina)[1:]:
-        m_id = ID_RE.search(bloco)
+        m_ai = ABRE_INTEGRA_RE.search(bloco)
+        if m_ai:
+            doc_id, tipo = m_ai.group(1), m_ai.group(2) or "acordao_eproc"
+        else:
+            m_id = ID_RE.search(bloco)
+            doc_id, tipo = (m_id.group(1), "acordao_eproc") if m_id else ("", "")
         texto = limpar_fragmento(bloco)
         registros.append({
             "numero_processo": extrair_numero(texto),
             "relator": campo(texto, r"Relator(?:a|\s*\(a\))?"),
             "orgao_julgador": campo(texto, r"[OÓ]rg[aã]o\s+Julgador"),  # portal grafa "Orgão"
             "comarca": campo(texto, r"Origem"),
-            "data_julgamento": campo(texto, r"Julgado\s+em"),
+            "data_julgamento": normalizar_data(campo(texto, r"Julgado\s+em")),
             "classe": campo(texto, r"Classe"),
-            "doc_id": m_id.group(1) if m_id else "",
+            "doc_id": doc_id,
+            "tipo_doc": tipo,
         })
     return registros, total
 
@@ -343,14 +381,14 @@ def candidatos_pdf(texto_html, url_origem, excluir):
     return urls[:6]
 
 
-def baixar_documento(cliente, doc_id, base_destino):
+def baixar_documento(cliente, doc_id, tipo, base_destino):
     """Baixa o inteiro teor em base_destino(.pdf|.html); retorna (caminho, formato, url).
 
     1) integra.do com Content-Type/magic de PDF -> salva .pdf direto;
     2) integra.do devolveu visualizador HTML -> segue links candidatos a PDF;
     3) sem PDF localizável -> salva a versão html.do como .html (formato=html).
     """
-    url0 = url_integra(doc_id)
+    url0 = url_integra(doc_id, tipo)
     resposta = cliente.get(url0, stream=True, timeout=120)
     eh_pdf, primeiro, iterador = _classificar(resposta)
     if eh_pdf:
@@ -376,10 +414,15 @@ def baixar_documento(cliente, doc_id, base_destino):
             resp2.close()
             return caminho, "pdf", candidata
         resp2.close()
-    resp_html = cliente.get(url_html(doc_id), timeout=60)
+    url_h = url_html(doc_id, tipo)
+    try:
+        resp_html = cliente.get(url_h, timeout=60)
+    except requests.HTTPError:
+        url_h = url_html(doc_id, "acordaos")
+        resp_html = cliente.get(url_h, timeout=60)
     caminho = base_destino + ".html"
     _salvar_texto(caminho, texto_resposta(resp_html))
-    return caminho, "html", url_html(doc_id)
+    return caminho, "html", url_h
 
 
 def carregar_index(caminho_csv):
@@ -408,11 +451,11 @@ def regravar_index(caminho_csv, linhas):
 def reservar_base(camara, relator_consulta, doc_id, numero, ocupados):
     """Caminho relativo (sem extensão) do arquivo, com sufixo em caso de colisão
     de nome (ex.: dois acórdãos do mesmo processo: mérito + embargos)."""
-    nome = sanitizar_nome(numero) or doc_id
+    nome = sanitizar_nome(numero) or sanitizar_nome(doc_id) or "documento"
     base_rel = f"{camara}/{slug(relator_consulta)}/{nome}"
     dono = ocupados.get(base_rel)
     if dono and dono != doc_id:
-        base_rel = f"{base_rel}_{doc_id[-8:]}"
+        base_rel = f"{base_rel}_{sanitizar_nome(doc_id[-8:]) or 'dup'}"
     ocupados[base_rel] = doc_id
     return base_rel
 
@@ -488,7 +531,8 @@ def main(argv=None):
         os.makedirs(os.path.join(saida, os.path.dirname(base_rel)), exist_ok=True)
         try:
             caminho, formato, url_final = baixar_documento(
-                cliente, linha["doc_id"], os.path.join(saida, base_rel))
+                cliente, linha["doc_id"], tipo_do_documento(linha),
+                os.path.join(saida, base_rel))
         except Exception as exc:
             stats["falhas_download"] += 1
             logging.error("download %s (processo %s): %s",
@@ -511,11 +555,11 @@ def main(argv=None):
         existente = por_id.get(doc_id)
         if existente is None:
             linha = {coluna: "" for coluna in COLUNAS}
-            linha.update(reg)
+            linha.update({chave: valor for chave, valor in reg.items() if chave in COLUNAS})
             linha["relator"] = reg["relator"] or relator
             linha["camara"] = camara
             linha["eixo_origem"] = eixo
-            linha["url_integra"] = url_integra(doc_id)
+            linha["url_integra"] = url_integra(doc_id, reg.get("tipo_doc") or "acordao_eproc")
             base_rel = reservar_base(camara, relator, doc_id, reg["numero_processo"], ocupados)
             arquivo, formato = arquivo_existente(saida, base_rel)
             if arquivo:

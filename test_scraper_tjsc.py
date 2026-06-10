@@ -3,10 +3,13 @@
 
 Roda com: python test_scraper_tjsc.py -v
 
-O stub reproduz o contrato do portal real: GET / para sessão, robots.txt,
-POST buscaajax.do paginado com rótulos textuais ("Processo:", "Relatora:",
-"Orgão Julgador:"...), e integra.do em três variantes: PDF direto, visualizador
-HTML com link para o PDF real, e visualizador sem PDF (fallback html.do).
+O stub reproduz o contrato REAL do portal (validado em snapshots de produção):
+GET / para sessão, robots.txt, POST buscaajax.do decodificado como ISO-8859-1,
+total no formato "<b>N</b> resultados encontrados", rótulo "Processo:"
+duplicado em comentário HTML, id/tipo do documento na chamada JS
+abreIntegra('pos','<id>','<tipo>',...), data em formato Java, e integra.do em
+três variantes de download: PDF direto, visualizador HTML com link para o PDF
+real, e visualizador sem PDF (fallback html.do).
 """
 
 import csv
@@ -20,14 +23,16 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-ID_A = "1" * 30   # integra.do devolve PDF direto (Content-Type correto)
-ID_B = "2" * 30   # integra.do devolve visualizador HTML com iframe -> PDF real
-ID_C = "3" * 30   # integra.do sem PDF localizável -> fallback html.do
-ID_D = "4" * 30   # PDF com Content-Type errado (text/html) -> magic bytes %PDF
+ID_A = "1" * 30                # eproc: id numérico de 30 dígitos -> PDF direto
+ID_B = "AABAg7AAIAALH5CAAF"    # SAJ (acordao_5): visualizador com iframe -> PDF real
+ID_C = "AAAbmQ+ACAANriqAAP"    # antigo (acordao), ROWID com '+': fallback html.do
+ID_D = "4" * 30                # PDF com Content-Type errado -> magic bytes %PDF
+TIPOS = {ID_A: "acordao_eproc", ID_B: "acordao_5", ID_C: "acordao",
+         ID_D: "acordao_eproc"}
 
 NUM_A = "5000001-11.2024.8.24.0000"
 NUM_B = "5000002-22.2024.8.24.0000"
-NUM_C = "5000003-33.2024.8.24.0000"
+NUM_C = "2013.080271-0"
 NUM_D = NUM_A  # mesmo número de processo que A: testa colisão de nome de arquivo
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
@@ -36,20 +41,33 @@ RELATORA = "Cláudia Lambert de Faria"
 
 
 def registro_html(numero, doc_id):
-    """Um resultado de busca como o portal devolve (entidades HTML incluídas)."""
+    """Um resultado como o portal devolve (markup real, entidades incluídas)."""
+    tipo = TIPOS[doc_id]
     return f"""
-    <div class="resultado">
-      <p><strong>Processo:</strong>
-         <a href="/jurisprudencia/html.do?id={doc_id}&amp;categoria=acordao_eproc">{numero}</a>
-         (Ac&oacute;rd&atilde;o do Tribunal de Justi&ccedil;a)</p>
-      <p><strong>Relatora:</strong> Cl&aacute;udia Lambert de Faria</p>
-      <p><strong>Origem:</strong> Florian&oacute;polis</p>
-      <p><strong>Org&atilde;o Julgador:</strong> Nona C&acirc;mara de Direito Civil</p>
-      <p><strong>Julgado em:</strong> 12/03/2025</p>
-      <p><strong>Classe:</strong> Agravo de Instrumento</p>
-      <p>Ementa: ALIMENTOS. TUTELA DE URG&Ecirc;NCIA. COGNI&Ccedil;&Atilde;O SUM&Aacute;RIA.</p>
-      <a href="integra.do?rowid={doc_id}&amp;tipo=acordao_eproc">Inteiro teor</a>
-    </div>"""
+<div class="resultados">
+  <div class="icones"><a href='#' onclick="javascript:openLinkAcompanhamento('{tipo}','{numero}');return false;" ><img src="imagens/search.png" /></a></div>
+  <p>
+  <!-- <strong>Processo:</strong> <u>{numero} (Ac&oacute;rd&atilde;o)</u><br /> -->
+  <strong>Processo:</strong> <a href="#" onclick="javascript:openLinkAcompanhamento('{tipo}','{numero}');return false;" ><u>{numero} (Ac&oacute;rd&atilde;o do Tribunal de Justi&ccedil;a)</u></a><br />
+  <strong>Relatora:</strong> Cl&aacute;udia Lambert de Faria<br />
+  <strong>Origem:</strong> Florian&oacute;polis<br />
+  <strong>Org&atilde;o Julgador:</strong> Nona C&acirc;mara de Direito Civil<br />
+  <strong>Julgado em:</strong> Thu Aug 27 00:00:00 GMT-03:00 2020  <a href='#' onclick="abreIntegra('1','{doc_id}','{tipo}','22440165654268023');return false;" ><input name="botao" type="button" value="Inteiro Teor" class="bt_integra" ></a><br />
+  <strong>Juiz Prolator:</strong> N&atilde;o informado<br />
+  <div><strong>Classe:</strong> Agravo de Instrumento</div>
+  <p><strong>Ementa:</strong></p>
+  <p>ALIMENTOS. TUTELA DE URG&Ecirc;NCIA. COGNI&Ccedil;&Atilde;O SUM&Aacute;RIA.</p>
+</div>"""
+
+
+def pagina_resultados(total, blocos):
+    cabecalho = (f'<div class="texto_resultados"> <b>{total}</b> resultados '
+                 "encontrados (0.038 segundos)</div>")
+    return f"<html><body>{cabecalho}{blocos}</body></html>"
+
+
+PAGINA_VAZIA = ("<html><body>Considerando que o sistema n&atilde;o encontrou "
+                "resultados, analise os itens a seguir</body></html>")
 
 
 class Portal(BaseHTTPRequestHandler):
@@ -83,8 +101,11 @@ class Portal(BaseHTTPRequestHandler):
                             [("Set-Cookie", "JSESSIONID=teste; Path=/")])
         elif rota.path == "/jurisprudencia/integra.do":
             rowid = parametros.get("rowid", [""])[0]
+            tipo = parametros.get("tipo", [""])[0]
             self._conta(f"integra:{rowid}")
-            if rowid == ID_A:
+            if tipo != TIPOS.get(rowid):  # o tipo do registro deve ser propagado
+                self.send_error(404)
+            elif rowid == ID_A:
                 self._responder(PDF_BYTES, "application/pdf")
             elif rowid == ID_B:
                 self._responder('<html><iframe src="/arquivos/B.pdf"></iframe></html>',
@@ -101,9 +122,13 @@ class Portal(BaseHTTPRequestHandler):
             self._responder(PDF_BYTES, "application/octet-stream")
         elif rota.path == "/jurisprudencia/html.do":
             doc = parametros.get("id", [""])[0]
+            categoria = parametros.get("categoria", [""])[0]
             self._conta(f"htmldo:{doc}")
-            self._responder(f"<html><body>Acordao {doc} em HTML (inteiro teor)</body></html>",
-                            "text/html; charset=utf-8")
+            if categoria != TIPOS.get(doc):
+                self.send_error(404)
+            else:
+                self._responder(f"<html><body>Acordao {doc} em HTML (inteiro teor)"
+                                "</body></html>", "text/html; charset=utf-8")
         else:
             self.send_error(404)
 
@@ -122,20 +147,16 @@ class Portal(BaseHTTPRequestHandler):
         eixo_frase = bool(corpo.get("frase", [""])[0])
         if (corpo.get("relator", [""])[0] != RELATORA
                 or corpo.get("frase", [""])[0] not in ("", "tutela de urgência")):
-            self._responder("<html>Considerando que o sistema não encontrou "
-                            "resultados, analise os itens a seguir</html>",
-                            "text/html; charset=utf-8")
+            self._responder(PAGINA_VAZIA, "text/html; charset=utf-8")
             return
         if eixo_frase:
             # total declarado 60 com ps=50 -> o scraper deve pedir a página 2 e parar
-            cabecalho = "<p>60 resultados encontrados</p>"
-            blocos = (registro_html(NUM_A, ID_A) + registro_html(NUM_B, ID_B)
-                      if pagina == 1 else registro_html(NUM_D, ID_D))
+            corpo_html = (registro_html(NUM_A, ID_A) + registro_html(NUM_B, ID_B)
+                          if pagina == 1 else registro_html(NUM_D, ID_D))
+            self._responder(pagina_resultados(60, corpo_html), "text/html; charset=utf-8")
         else:
-            cabecalho = "<p>2 resultados encontrados</p>"
-            blocos = registro_html(NUM_A, ID_A) + registro_html(NUM_C, ID_C)
-        self._responder(f"<html><body>{cabecalho}{blocos}</body></html>",
-                        "text/html; charset=utf-8")
+            corpo_html = registro_html(NUM_A, ID_A) + registro_html(NUM_C, ID_C)
+            self._responder(pagina_resultados(2, corpo_html), "text/html; charset=utf-8")
 
 
 class Servidor(ThreadingHTTPServer):
@@ -192,19 +213,26 @@ class TesteScraper(unittest.TestCase):
                 if chave.startswith(("integra:", "htmldo:", "arquivo_b"))}
 
     def test_parser(self):
-        html = ("<p>1.234 resultados encontrados</p>" + registro_html(NUM_A, ID_A)
-                + registro_html(NUM_C, ID_C))
+        html = ('<div class="texto_resultados"> <b>1.234</b> resultados '
+                "encontrados (0.05 segundos)</div>"
+                + registro_html(NUM_A, ID_A) + registro_html(NUM_C, ID_C))
         registros, total = self.scraper.parse_resultados(html)
         self.assertEqual(total, 1234)
-        self.assertEqual(len(registros), 2)
+        self.assertEqual(len(registros), 2,
+                         "o 'Processo:' duplicado em comentário não pode virar registro")
         primeiro = registros[0]
         self.assertEqual(primeiro["numero_processo"], NUM_A)
         self.assertEqual(primeiro["doc_id"], ID_A)
+        self.assertEqual(primeiro["tipo_doc"], "acordao_eproc")
         self.assertEqual(primeiro["relator"], RELATORA)
         self.assertEqual(primeiro["orgao_julgador"], "Nona Câmara de Direito Civil")
         self.assertEqual(primeiro["comarca"], "Florianópolis")
-        self.assertEqual(primeiro["data_julgamento"], "12/03/2025")
+        self.assertEqual(primeiro["data_julgamento"], "27/08/2020",
+                         "data Java deve ser convertida para dd/mm/aaaa")
         self.assertEqual(primeiro["classe"], "Agravo de Instrumento")
+        self.assertEqual(registros[1]["numero_processo"], NUM_C)
+        self.assertEqual(registros[1]["doc_id"], ID_C)
+        self.assertEqual(registros[1]["tipo_doc"], "acordao")
 
     def test_fluxo_dry_run_download_e_idempotencia(self):
         # 1) dry-run: cataloga 4 documentos únicos (A deduplicado entre eixos), não baixa
@@ -214,6 +242,9 @@ class TesteScraper(unittest.TestCase):
         self.assertEqual(set(por_id), {ID_A, ID_B, ID_C, ID_D})
         self.assertEqual(por_id[ID_A]["eixo_origem"], "prova_cognicao")  # 1º eixo a encontrar
         self.assertEqual(por_id[ID_C]["eixo_origem"], "binomio_renda")
+        self.assertIn("tipo=acordao_5", por_id[ID_B]["url_integra"])
+        self.assertIn("rowid=AAAbmQ%2BACAANriqAAP", por_id[ID_C]["url_integra"],
+                      "o '+' do ROWID precisa ir percent-encodado na URL")
         self.assertTrue(all(linha["formato"] == "" and linha["arquivo"] == ""
                             for linha in linhas))
         self.assertEqual(self._downloads(), {}, "dry-run não pode baixar nada")
@@ -232,7 +263,7 @@ class TesteScraper(unittest.TestCase):
         self.assertEqual(por_id[ID_A]["arquivo"], f"{pasta}/{NUM_A}.pdf")
         self.assertEqual(por_id[ID_B]["formato"], "pdf", "deveria achar o PDF via iframe")
         self.assertEqual(por_id[ID_C]["formato"], "html", "sem PDF -> fallback html.do")
-        self.assertTrue(por_id[ID_C]["arquivo"].endswith(f"{NUM_C}.html"))
+        self.assertEqual(por_id[ID_C]["arquivo"], f"{pasta}/{NUM_C}.html")
         self.assertEqual(por_id[ID_D]["formato"], "pdf", "magic bytes %PDF com CT text/html")
         self.assertEqual(por_id[ID_D]["arquivo"], f"{pasta}/{NUM_A}_{ID_D[-8:]}.pdf",
                          "colisão de número de processo deve ganhar sufixo")
