@@ -39,8 +39,10 @@ decisoes_tjsc/
   run.log
 ```
 
-Documentos cujo `integra.do` não entrega PDF são salvos como `.html` e
-marcados com `formato=html` no catálogo. Quando dois acórdãos compartilham o
+Acórdãos do eproc são entregues pelo portal como **RTF** (abre no Word) e
+salvos como `.rtf` com `formato=rtf`; quando o `integra.do` entrega PDF, sai
+`.pdf`. Documentos sem PDF/RTF localizável são salvos como `.html` e marcados
+com `formato=html` no catálogo. Quando dois acórdãos compartilham o
 mesmo número de processo (ex.: mérito + embargos), o segundo arquivo recebe um
 sufixo com o final do `doc_id`.
 

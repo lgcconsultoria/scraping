@@ -29,15 +29,18 @@ ID_A = "1" * 30                # eproc: id numérico de 30 dígitos -> PDF diret
 ID_B = "AABAg7AAIAALH5CAAF"    # SAJ (acordao_5): visualizador com iframe -> PDF real
 ID_C = "AAAbmQ+ACAANriqAAP"    # antigo (acordao), ROWID com '+': fallback html.do
 ID_D = "4" * 30                # PDF com Content-Type errado -> magic bytes %PDF
+ID_E = "5" * 30                # eproc que entrega RTF pelo integra.do
 TIPOS = {ID_A: "acordao_eproc", ID_B: "acordao_5", ID_C: "acordao",
-         ID_D: "acordao_eproc"}
+         ID_D: "acordao_eproc", ID_E: "acordao_eproc"}
 
 NUM_A = "5000001-11.2024.8.24.0000"
 NUM_B = "5000002-22.2024.8.24.0000"
 NUM_C = "2013.080271-0"
 NUM_D = NUM_A  # mesmo número de processo que A: testa colisão de nome de arquivo
+NUM_E = "5000005-55.2025.8.24.0000"
 
 PDF_BYTES = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
+RTF_BYTES = b"{\\rtf1\\ansi Conteudo integral do acordao}"
 
 RELATORA = "Cláudia Lambert de Faria"
 
@@ -117,6 +120,8 @@ class Portal(BaseHTTPRequestHandler):
                                 "ajuda</a> sem documento</html>", "text/html; charset=utf-8")
             elif rowid == ID_D:
                 self._responder(PDF_BYTES, "text/html")  # CT errado de propósito
+            elif rowid == ID_E:
+                self._responder(RTF_BYTES, "application/rtf")  # eproc entrega RTF
             else:
                 self.send_error(404)
         elif rota.path == "/arquivos/B.pdf":
@@ -157,8 +162,9 @@ class Portal(BaseHTTPRequestHandler):
                           if pagina == 1 else registro_html(NUM_D, ID_D))
             self._responder(pagina_resultados(60, corpo_html), "text/html; charset=utf-8")
         else:
-            corpo_html = registro_html(NUM_A, ID_A) + registro_html(NUM_C, ID_C)
-            self._responder(pagina_resultados(2, corpo_html), "text/html; charset=utf-8")
+            corpo_html = (registro_html(NUM_A, ID_A) + registro_html(NUM_C, ID_C)
+                          + registro_html(NUM_E, ID_E))
+            self._responder(pagina_resultados(3, corpo_html), "text/html; charset=utf-8")
 
 
 class Servidor(ThreadingHTTPServer):
@@ -237,11 +243,11 @@ class TesteScraper(unittest.TestCase):
         self.assertEqual(registros[1]["tipo_doc"], "acordao")
 
     def test_fluxo_dry_run_download_e_idempotencia(self):
-        # 1) dry-run: cataloga 4 documentos únicos (A deduplicado entre eixos), não baixa
+        # 1) dry-run: cataloga 5 documentos únicos (A deduplicado entre eixos), não baixa
         self._rodar("--dry-run")
         linhas, por_id = self._csv()
-        self.assertEqual(len(linhas), 4)
-        self.assertEqual(set(por_id), {ID_A, ID_B, ID_C, ID_D})
+        self.assertEqual(len(linhas), 5)
+        self.assertEqual(set(por_id), {ID_A, ID_B, ID_C, ID_D, ID_E})
         self.assertEqual(por_id[ID_A]["eixo_origem"], "prova_cognicao")  # 1º eixo a encontrar
         self.assertEqual(por_id[ID_C]["eixo_origem"], "binomio_renda")
         self.assertIn("tipo=acordao_5", por_id[ID_B]["url_integra"])
@@ -256,10 +262,10 @@ class TesteScraper(unittest.TestCase):
         self.assertIn("claudia_lambert_de_faria_binomio_renda_p1.html", raw)
         self.assertTrue(os.path.exists(os.path.join(self.saida, "run.log")))
 
-        # 2) execução real: baixa os 4 e reconcilia o index.csv (sem duplicar linhas)
+        # 2) execução real: baixa os 5 e reconcilia o index.csv (sem duplicar linhas)
         self._rodar()
         linhas, por_id = self._csv()
-        self.assertEqual(len(linhas), 4)
+        self.assertEqual(len(linhas), 5)
         pasta = "9a_camara/claudia_lambert_de_faria"
         self.assertEqual(por_id[ID_A]["formato"], "pdf")
         self.assertEqual(por_id[ID_A]["arquivo"], f"{pasta}/{NUM_A}.pdf")
@@ -269,10 +275,14 @@ class TesteScraper(unittest.TestCase):
         self.assertEqual(por_id[ID_D]["formato"], "pdf", "magic bytes %PDF com CT text/html")
         self.assertEqual(por_id[ID_D]["arquivo"], f"{pasta}/{NUM_A}_{ID_D[-8:]}.pdf",
                          "colisão de número de processo deve ganhar sufixo")
+        self.assertEqual(por_id[ID_E]["formato"], "rtf", "eproc entrega RTF pelo integra.do")
+        self.assertEqual(por_id[ID_E]["arquivo"], f"{pasta}/{NUM_E}.rtf")
         for doc_id in (ID_A, ID_B, ID_D):
             caminho = os.path.join(self.saida, por_id[doc_id]["arquivo"])
             with open(caminho, "rb") as arq:
                 self.assertTrue(arq.read().startswith(b"%PDF"), caminho)
+        with open(os.path.join(self.saida, por_id[ID_E]["arquivo"]), "rb") as arq:
+            self.assertTrue(arq.read().startswith(b"{\\rtf"))
         with open(os.path.join(self.saida, por_id[ID_C]["arquivo"]), encoding="utf-8") as arq:
             self.assertIn("inteiro teor", arq.read())
         downloads_apos_real = self._downloads()
@@ -281,7 +291,7 @@ class TesteScraper(unittest.TestCase):
         # 3) reexecução: nada é rebaixado, catálogo não ganha linhas duplicadas
         self._rodar()
         linhas, _ = self._csv()
-        self.assertEqual(len(linhas), 4)
+        self.assertEqual(len(linhas), 5)
         self.assertEqual(self._downloads(), downloads_apos_real,
                          "reexecução não pode repetir downloads")
 
@@ -290,7 +300,7 @@ class TesteScraper(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             self.scraper.main(["--out", self.saida, "--diagnostico", RELATORA])
         texto = buf.getvalue()
-        self.assertIn("2 resultado(s)", texto)
+        self.assertIn("3 resultado(s)", texto)
         self.assertIn(NUM_A, texto)
         self.assertFalse(os.path.exists(os.path.join(self.saida, "index.csv")),
                          "diagnóstico não pode mexer no catálogo")

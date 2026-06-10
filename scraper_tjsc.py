@@ -3,8 +3,8 @@
 
 Coleta acórdãos de 8 desembargadores das 9ª e 10ª Câmaras de Direito Civil em
 dois eixos temáticos (dicionário EIXOS, configurável abaixo), baixa o inteiro
-teor de cada decisão (PDF, com fallback para HTML) e mantém um catálogo
-incremental em <saida>/index.csv.
+teor de cada decisão (PDF ou RTF — o eproc entrega RTF —, com fallback para
+HTML) e mantém um catálogo incremental em <saida>/index.csv.
 
 Uso:
     python scraper_tjsc.py --dry-run    # busca e cataloga, sem baixar nada
@@ -329,16 +329,23 @@ def buscar(cliente, relator, params_eixo, ps=PS):
 
 
 def _classificar(resposta):
-    """Espia o primeiro chunk: PDF por Content-Type OU pelos magic bytes %PDF."""
+    """Espia o primeiro chunk e identifica o formato (pdf/rtf) por Content-Type
+    ou magic bytes; acórdãos do eproc são entregues como RTF pelo integra.do."""
     iterador = resposta.iter_content(8192)
     primeiro = b""
     for chunk in iterador:
         if chunk:
             primeiro = chunk
             break
-    eh_pdf = ("pdf" in resposta.headers.get("Content-Type", "").lower()
-              or primeiro.lstrip().startswith(b"%PDF"))
-    return eh_pdf, primeiro, iterador
+    ct = resposta.headers.get("Content-Type", "").lower()
+    inicio = primeiro.lstrip()
+    if "pdf" in ct or inicio.startswith(b"%PDF"):
+        formato = "pdf"
+    elif inicio.startswith(b"{\\rtf") or "rtf" in ct or "msword" in ct:
+        formato = "rtf"
+    else:
+        formato = ""
+    return formato, primeiro, iterador
 
 
 def _salvar_binario(caminho, primeiro, iterador):
@@ -382,20 +389,21 @@ def candidatos_pdf(texto_html, url_origem, excluir):
 
 
 def baixar_documento(cliente, doc_id, tipo, base_destino):
-    """Baixa o inteiro teor em base_destino(.pdf|.html); retorna (caminho, formato, url).
+    """Baixa o inteiro teor em base_destino(.pdf|.rtf|.html); retorna
+    (caminho, formato, url).
 
-    1) integra.do com Content-Type/magic de PDF -> salva .pdf direto;
+    1) integra.do com PDF ou RTF (eproc entrega RTF) -> salva direto;
     2) integra.do devolveu visualizador HTML -> segue links candidatos a PDF;
-    3) sem PDF localizável -> salva a versão html.do como .html (formato=html).
+    3) sem documento localizável -> salva a versão html.do como .html.
     """
     url0 = url_integra(doc_id, tipo)
     resposta = cliente.get(url0, stream=True, timeout=120)
-    eh_pdf, primeiro, iterador = _classificar(resposta)
-    if eh_pdf:
-        caminho = base_destino + ".pdf"
+    formato, primeiro, iterador = _classificar(resposta)
+    if formato:
+        caminho = base_destino + "." + formato
         _salvar_binario(caminho, primeiro, iterador)
         resposta.close()
-        return caminho, "pdf", url0
+        return caminho, formato, url0
     corpo = primeiro + b"".join(iterador)
     url_visualizador = resposta.url or url0
     codificacao = resposta.encoding or "utf-8"
@@ -407,12 +415,12 @@ def baixar_documento(cliente, doc_id, tipo, base_destino):
         except requests.RequestException as exc:
             logging.debug("candidato a PDF falhou (%s): %s", candidata, exc)
             continue
-        eh_pdf2, primeiro2, iterador2 = _classificar(resp2)
-        if eh_pdf2:
-            caminho = base_destino + ".pdf"
+        formato2, primeiro2, iterador2 = _classificar(resp2)
+        if formato2:
+            caminho = base_destino + "." + formato2
             _salvar_binario(caminho, primeiro2, iterador2)
             resp2.close()
-            return caminho, "pdf", candidata
+            return caminho, formato2, candidata
         resp2.close()
     url_h = url_html(doc_id, tipo)
     try:
@@ -461,7 +469,7 @@ def reservar_base(camara, relator_consulta, doc_id, numero, ocupados):
 
 
 def arquivo_existente(saida, base_rel):
-    for extensao, formato in ((".pdf", "pdf"), (".html", "html")):
+    for extensao, formato in ((".pdf", "pdf"), (".rtf", "rtf"), (".html", "html")):
         if os.path.exists(os.path.join(saida, base_rel + extensao)):
             return base_rel + extensao, formato
     return "", ""
@@ -644,7 +652,8 @@ def main(argv=None):
             logging.info("index.csv regravado para refletir downloads/atualizações.")
 
     resumo = ("consultas={consultas} | novos={novos} | reencontrados={reencontrados} | "
-              "baixados_pdf={baixados_pdf} | baixados_html={baixados_html} | "
+              "baixados_pdf={baixados_pdf} | baixados_rtf={baixados_rtf} | "
+              "baixados_html={baixados_html} | "
               "pulados_existentes={pulados} | falhas_download={falhas_download} | "
               "falhas_busca={falhas_busca} | sem_id={sem_id}").format_map(stats)
     logging.info("FIM | %s", resumo)
