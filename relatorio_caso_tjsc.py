@@ -588,6 +588,10 @@ def main(argv=None):
             aplicacoes = {}  # agravo mudou -> análises antigas não valem mais
         else:
             perfil = perfil_meta["perfil"]
+        logging.info("Perfil: %s teses — %s",
+                     len(perfil.get("teses", [])),
+                     " | ".join(f"{t['id']}: {t['titulo']}"
+                                for t in perfil.get("teses", [])))
         perfil_str = json.dumps(perfil, ensure_ascii=False, indent=1)
         sist_extr = bloco_sistema(SIST_EXTRACAO.format(perfil=perfil_str))
         sist_apli = bloco_sistema(SIST_APLICACAO.format(perfil=perfil_str))
@@ -601,6 +605,8 @@ def main(argv=None):
                     logging.warning("[extração %s/%s] %s: sem texto extraível, pulando",
                                     indice, len(pend_extracao), rotulo)
                     continue
+                logging.info("[extração %s/%s] %s: %s chars → enviando ao modelo",
+                             indice, len(pend_extracao), rotulo, len(texto))
                 extracao = extrair_acordao(cliente, sist_extr, linha, texto,
                                            args.modelo_leve, contador)
                 registro = {chave: linha.get(chave, "") for chave in
@@ -609,9 +615,13 @@ def main(argv=None):
                 registro.update(hash_arquivo=hashes[linha["doc_id"]], extracao=extracao)
                 extracoes[linha["doc_id"]] = registro
                 estagios["extracao"] += 1
-                logging.info("[extração %s/%s] %s -> relevante=%s (%s) | ~US$ %.2f",
+                teses = extracao.get("teses_tocadas") or []
+                ratio = (extracao.get("ratio_decidendi") or "").replace("\n", " ")[:200]
+                logging.info("[extração %s/%s] %s -> relevante=%s (%s) teses=%s | ~US$ %.2f",
                              indice, len(pend_extracao), rotulo, extracao["relevante"],
-                             extracao["posicao_preliminar"], contador.custo())
+                             extracao["posicao_preliminar"], teses or "nenhuma", contador.custo())
+                if ratio:
+                    logging.info("  ratio: %s", ratio)
             except Exception as exc:
                 estagios["falhas"] += 1
                 logging.error("[extração] %s: %s", rotulo, exc)
