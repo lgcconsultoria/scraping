@@ -17,8 +17,10 @@ pip install -r requirements.txt   # apenas 'requests'
 
 ```bash
 python scraper_tjsc.py --dry-run   # 1º passo: busca e monta o index.csv SEM baixar nada
-python scraper_tjsc.py             # 2º passo: baixa os inteiros teores (PDF/HTML)
+python scraper_tjsc.py             # 2º passo: baixa os inteiros teores (PDF/RTF/HTML)
 python scraper_tjsc.py --out DIR   # muda o diretório de saída (padrão: decisoes_tjsc)
+python scraper_tjsc.py --eixo alimentos_amplo      # roda só um eixo (repita a flag)
+python scraper_tjsc.py --diagnostico "Nome Aqui"   # busca só por relator: valida grafia
 ```
 
 Fluxo recomendado: rode primeiro com `--dry-run`, revise o `index.csv` e só

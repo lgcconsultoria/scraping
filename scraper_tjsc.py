@@ -97,6 +97,18 @@ EIXOS = {
         "q": "alimentos possibilidade renda",
         "classe": "Agravo de Instrumento",
     },
+    # Eixos amplos: termos abertos para varrer o acervo das novas câmaras.
+    # Sem filtro de classe (alcança também apelações); datainicial segura o
+    # volume — ajuste o período conforme a necessidade. Rode --dry-run antes
+    # de baixar e use --eixo para executar um eixo por vez.
+    "alimentos_amplo": {
+        "q": "alimentos",
+        "datainicial": "01/01/2025",
+    },
+    "alimentos_ex_conjuge": {
+        "q": "alimentos",
+        "frase": "ex-cônjuge",
+    },
 }
 
 COLUNAS = [
@@ -499,7 +511,13 @@ def main(argv=None):
     parser.add_argument("--diagnostico", metavar="RELATOR",
                         help="roda UMA busca só por relator (sem tema/classe) e mostra o "
                              "total e os primeiros resultados; útil para validar grafias")
+    parser.add_argument("--eixo", action="append", metavar="NOME",
+                        help="limita a execução aos eixos informados (repita a flag); "
+                             "opções: " + ", ".join(sorted(EIXOS)))
     args = parser.parse_args(argv)
+    for nome_eixo in args.eixo or []:
+        if nome_eixo not in EIXOS:
+            parser.error(f"eixo desconhecido: {nome_eixo!r} (opções: {', '.join(sorted(EIXOS))})")
 
     saida = args.out
     os.makedirs(os.path.join(saida, "_raw_html"), exist_ok=True)
@@ -624,6 +642,8 @@ def main(argv=None):
         for camara, nomes in RELATORES.items():
             for relator in nomes:
                 for eixo, params in EIXOS.items():
+                    if args.eixo and eixo not in args.eixo:
+                        continue
                     stats["consultas"] += 1
                     novos_consulta = 0
                     total_consulta = 0

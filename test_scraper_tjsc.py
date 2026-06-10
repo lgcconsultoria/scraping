@@ -309,6 +309,12 @@ class TesteScraper(unittest.TestCase):
             self.scraper.main(["--out", self.saida, "--diagnostico", "Nome Errado"])
         self.assertIn("Nenhum registro", buf.getvalue())
 
+    def test_filtro_eixo(self):
+        self._rodar("--dry-run", "--eixo", "binomio_renda")
+        linhas, por_id = self._csv()
+        self.assertEqual(set(por_id), {ID_A, ID_C, ID_E})
+        self.assertTrue(all(linha["eixo_origem"] == "binomio_renda" for linha in linhas))
+
     def test_robots_bloqueado_aborta(self):
         self.servidor.robots_bloqueia = True
         with self.assertRaises(SystemExit) as contexto:
