@@ -62,3 +62,18 @@ def salvar_texto(caminho, conteudo):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+def salvar_binario(caminho, primeiro, iterador):
+    """Salva chunks binários em caminho atomicamente (via arquivo .part)."""
+    tmp = caminho + ".part"
+    try:
+        with open(tmp, "wb") as arq:
+            arq.write(primeiro)
+            for chunk in iterador:
+                if chunk:
+                    arq.write(chunk)
+        os.replace(tmp, caminho)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)

@@ -67,3 +67,26 @@ def texto_resposta(resposta):
     if "charset" not in resposta.headers.get("Content-Type", "").lower():
         resposta.encoding = resposta.apparent_encoding or resposta.encoding
     return resposta.text
+
+
+def classificar_resposta(resposta):
+    """Lê o primeiro chunk de uma resposta em streaming e identifica o formato.
+
+    Retorna (formato, primeiro_chunk, iterador) onde formato é "pdf", "rtf" ou "".
+    Usa Content-Type e magic bytes; acórdãos do eproc chegam como RTF.
+    """
+    iterador = resposta.iter_content(8192)
+    primeiro = b""
+    for chunk in iterador:
+        if chunk:
+            primeiro = chunk
+            break
+    ct = resposta.headers.get("Content-Type", "").lower()
+    inicio = primeiro.lstrip()
+    if "pdf" in ct or inicio.startswith(b"%PDF"):
+        formato = "pdf"
+    elif inicio.startswith(b"{\\rtf") or "rtf" in ct or "msword" in ct:
+        formato = "rtf"
+    else:
+        formato = ""
+    return formato, primeiro, iterador

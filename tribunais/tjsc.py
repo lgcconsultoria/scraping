@@ -8,8 +8,8 @@ from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 
 import requests
 
-from nucleo.cache import salvar_texto
-from nucleo.http import ClienteHttp, texto_resposta
+from nucleo.cache import salvar_binario, salvar_texto
+from nucleo.http import ClienteHttp, classificar_resposta, texto_resposta
 from tribunais.base import AdaptadorTribunal, InteiroTeor
 
 # ---------------------------------------------------------------------------
@@ -127,41 +127,7 @@ def candidatos_pdf(texto_html, url_origem, excluir):
     return urls[:6]
 
 
-# ---------------------------------------------------------------------------
-# Helpers de I/O binário
-# ---------------------------------------------------------------------------
-
-def _classificar(resposta):
-    """Espiona o primeiro chunk e identifica o formato por Content-Type ou magic bytes."""
-    iterador = resposta.iter_content(8192)
-    primeiro = b""
-    for chunk in iterador:
-        if chunk:
-            primeiro = chunk
-            break
-    ct = resposta.headers.get("Content-Type", "").lower()
-    inicio = primeiro.lstrip()
-    if "pdf" in ct or inicio.startswith(b"%PDF"):
-        formato = "pdf"
-    elif inicio.startswith(b"{\\rtf") or "rtf" in ct or "msword" in ct:
-        formato = "rtf"
-    else:
-        formato = ""
-    return formato, primeiro, iterador
-
-
-def _salvar_binario(caminho, primeiro, iterador):
-    tmp = caminho + ".part"
-    try:
-        with open(tmp, "wb") as arq:
-            arq.write(primeiro)
-            for chunk in iterador:
-                if chunk:
-                    arq.write(chunk)
-        os.replace(tmp, caminho)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+# _classificar e _salvar_binario promovidos a nucleo.http / nucleo.cache.
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +228,10 @@ class AdaptadorTjsc(AdaptadorTribunal):
         """Tenta PDF/RTF via integra.do; cai para links no visualizador; fallback html.do."""
         url0 = self.url_integra(doc_id, tipo)
         resposta = self.cliente.get(url0, stream=True, timeout=120)
-        formato, primeiro, iterador = _classificar(resposta)
+        formato, primeiro, iterador = classificar_resposta(resposta)
         if formato:
             caminho = base_destino + "." + formato
-            _salvar_binario(caminho, primeiro, iterador)
+            salvar_binario(caminho, primeiro, iterador)
             resposta.close()
             return InteiroTeor(caminho=caminho, formato=formato, url=url0)
         corpo = primeiro + b"".join(iterador)
@@ -279,10 +245,10 @@ class AdaptadorTjsc(AdaptadorTribunal):
             except requests.RequestException as exc:
                 logging.debug("candidato a PDF falhou (%s): %s", candidata, exc)
                 continue
-            formato2, primeiro2, iterador2 = _classificar(resp2)
+            formato2, primeiro2, iterador2 = classificar_resposta(resp2)
             if formato2:
                 caminho = base_destino + "." + formato2
-                _salvar_binario(caminho, primeiro2, iterador2)
+                salvar_binario(caminho, primeiro2, iterador2)
                 resp2.close()
                 return InteiroTeor(caminho=caminho, formato=formato2, url=candidata)
             resp2.close()
