@@ -50,3 +50,15 @@ def salvar_json(caminho, dados):
     with open(tmp, "w", encoding="utf-8") as arq:
         json.dump(dados, arq, ensure_ascii=False, indent=1)
     os.replace(tmp, caminho)
+
+
+def salvar_texto(caminho, conteudo):
+    """Escreve conteudo em caminho atomicamente (via arquivo .tmp)."""
+    tmp = caminho + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as arq:
+            arq.write(conteudo)
+        os.replace(tmp, caminho)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
