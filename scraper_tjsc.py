@@ -46,7 +46,6 @@ import os
 import re
 import sys
 import time
-import unicodedata
 import urllib.robotparser
 from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 
@@ -54,6 +53,11 @@ try:
     import requests
 except ImportError:  # pragma: no cover
     sys.exit("Este script requer a biblioteca 'requests' (pip install requests).")
+
+from nucleo.http import ClienteHttp, texto_resposta
+from nucleo.catalogo import (COLUNAS, slug, sanitizar_nome,
+                              carregar_index, regravar_index,
+                              reservar_base, arquivo_existente)
 
 BASE = os.environ.get("TJSC_BASE", "https://busca.tjsc.jus.br/jurisprudencia").rstrip("/")
 SEARCH = f"{BASE}/buscaajax.do?categoria=acordaos"
@@ -111,12 +115,6 @@ EIXOS = {
     },
 }
 
-COLUNAS = [
-    "numero_processo", "relator", "camara", "orgao_julgador", "comarca",
-    "data_julgamento", "classe", "doc_id", "eixo_origem", "formato",
-    "arquivo", "url_integra",
-]
-
 ID_RE = re.compile(r"(?:rowid|id)=(\d{30})")
 # Link real do inteiro teor nos resultados: abreIntegra('pos','<id>','<tipo>',...)
 # id = ROWID alfanumérico (acordao/acordao_5) ou numérico de 30 dígitos (eproc).
@@ -137,16 +135,6 @@ ROTULO_ALT = (
 )
 
 
-def slug(texto):
-    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
-    texto = re.sub(r"\s+", "_", texto.strip().lower())
-    return re.sub(r"[^a-z0-9_]+", "", texto)
-
-
-def sanitizar_nome(nome):
-    return re.sub(r"[^\w.\-]+", "_", nome).strip("._-")[:150]
-
-
 def url_integra(doc_id, tipo="acordao_eproc"):
     return f"{BASE}/integra.do?rowid={quote(doc_id, safe='')}&tipo={quote(tipo, safe='')}"
 
@@ -159,57 +147,6 @@ def tipo_do_documento(linha):
     """Recupera o tipo (acordao, acordao_5, acordao_eproc...) da URL catalogada."""
     m = re.search(r"[?&](?:tipo|categoria)=([^&]+)", linha.get("url_integra", ""))
     return unquote(m.group(1)) if m else "acordao_eproc"
-
-
-class ClienteHttp:
-    """Sessão HTTP com rate limit global e backoff exponencial em 429/5xx."""
-
-    def __init__(self):
-        self.sessao = requests.Session()
-        self.sessao.headers.update({"User-Agent": USER_AGENT})
-        self._ultimo = 0.0
-
-    def _respeita_intervalo(self):
-        falta = MIN_INTERVALO - (time.monotonic() - self._ultimo)
-        if falta > 0:
-            time.sleep(falta)
-
-    def requisitar(self, metodo, url, **kw):
-        kw.setdefault("timeout", 60)
-        ultima_exc = None
-        for tentativa in range(1, MAX_TENTATIVAS + 1):
-            self._respeita_intervalo()
-            try:
-                resposta = self.sessao.request(metodo, url, **kw)
-            except (requests.ConnectionError, requests.Timeout) as exc:
-                self._ultimo = time.monotonic()
-                ultima_exc = exc
-                if tentativa < MAX_TENTATIVAS:
-                    espera = min(60, 2 * 2 ** tentativa)
-                    logging.warning("erro de rede (%s/%s) em %s: %s; aguardando %ss",
-                                    tentativa, MAX_TENTATIVAS, url, exc, espera)
-                    time.sleep(espera)
-                continue
-            self._ultimo = time.monotonic()
-            if resposta.status_code in (429, 500, 502, 503, 504) and tentativa < MAX_TENTATIVAS:
-                espera = min(60, 2 * 2 ** tentativa)
-                retry_after = resposta.headers.get("Retry-After", "").strip()
-                if retry_after.isdigit():
-                    espera = max(espera, int(retry_after))
-                logging.warning("HTTP %s (%s/%s) em %s; aguardando %ss",
-                                resposta.status_code, tentativa, MAX_TENTATIVAS, url, espera)
-                resposta.close()
-                time.sleep(espera)
-                continue
-            resposta.raise_for_status()
-            return resposta
-        raise ultima_exc if ultima_exc else RuntimeError(f"tentativas esgotadas: {url}")
-
-    def get(self, url, **kw):
-        return self.requisitar("GET", url, **kw)
-
-    def post(self, url, **kw):
-        return self.requisitar("POST", url, **kw)
 
 
 def robots_permite(cliente):
@@ -237,13 +174,6 @@ def robots_permite(cliente):
         return False
     logging.info("robots.txt lido: rotas necessárias permitidas.")
     return True
-
-
-def texto_resposta(resposta):
-    """Texto da resposta corrigindo charset ausente (portais legados usam latin-1)."""
-    if "charset" not in resposta.headers.get("Content-Type", "").lower():
-        resposta.encoding = resposta.apparent_encoding or resposta.encoding
-    return resposta.text
 
 
 def limpar_fragmento(fragmento):
@@ -445,48 +375,6 @@ def baixar_documento(cliente, doc_id, tipo, base_destino):
     return caminho, "html", url_h
 
 
-def carregar_index(caminho_csv):
-    """Carrega o catálogo existente: (todas_as_linhas, dicionário doc_id -> linha)."""
-    linhas, por_id = [], {}
-    if not os.path.exists(caminho_csv):
-        return linhas, por_id
-    with open(caminho_csv, newline="", encoding="utf-8") as arq:
-        for crua in csv.DictReader(arq):
-            linha = {coluna: (crua.get(coluna) or "").strip() for coluna in COLUNAS}
-            linhas.append(linha)
-            if linha["doc_id"]:
-                por_id.setdefault(linha["doc_id"], linha)
-    return linhas, por_id
-
-
-def regravar_index(caminho_csv, linhas):
-    tmp = caminho_csv + ".tmp"
-    with open(tmp, "w", newline="", encoding="utf-8") as arq:
-        escritor = csv.DictWriter(arq, fieldnames=COLUNAS)
-        escritor.writeheader()
-        escritor.writerows(linhas)
-    os.replace(tmp, caminho_csv)
-
-
-def reservar_base(camara, relator_consulta, doc_id, numero, ocupados):
-    """Caminho relativo (sem extensão) do arquivo, com sufixo em caso de colisão
-    de nome (ex.: dois acórdãos do mesmo processo: mérito + embargos)."""
-    nome = sanitizar_nome(numero) or sanitizar_nome(doc_id) or "documento"
-    base_rel = f"{camara}/{slug(relator_consulta)}/{nome}"
-    dono = ocupados.get(base_rel)
-    if dono and dono != doc_id:
-        base_rel = f"{base_rel}_{sanitizar_nome(doc_id[-8:]) or 'dup'}"
-    ocupados[base_rel] = doc_id
-    return base_rel
-
-
-def arquivo_existente(saida, base_rel):
-    for extensao, formato in ((".pdf", "pdf"), (".rtf", "rtf"), (".html", "html")):
-        if os.path.exists(os.path.join(saida, base_rel + extensao)):
-            return base_rel + extensao, formato
-    return "", ""
-
-
 def configurar_log(saida):
     logging.basicConfig(
         level=logging.INFO,
@@ -528,7 +416,9 @@ def main(argv=None):
     logging.info("início | dry_run=%s | saida=%s | base=%s | intervalo>=%ss",
                  args.dry_run, saida, BASE, MIN_INTERVALO)
 
-    cliente = ClienteHttp()
+    cliente = ClienteHttp(user_agent=USER_AGENT,
+                          min_intervalo=MIN_INTERVALO,
+                          max_tentativas=MAX_TENTATIVAS)
     try:
         if not robots_permite(cliente):
             logging.error("Abortando em respeito ao robots.txt do portal.")

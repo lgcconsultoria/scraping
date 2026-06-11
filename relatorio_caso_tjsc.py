@@ -36,12 +36,16 @@ import argparse
 import collections
 import csv
 import datetime
-import hashlib
 import json
 import logging
 import os
 import re
 import sys
+
+from nucleo.cache import (sha256_texto, sha256_arquivo,
+                           carregar_jsonl, compactar_jsonl,
+                           carregar_json, salvar_json)
+from nucleo.custos import Contador, PRECOS_USD
 
 try:
     import anthropic
@@ -60,14 +64,6 @@ MAX_TOKENS = {"perfil": 8000, "extracao": 8000, "aplicacao": 12000, "sintese": 1
 MIN_CHARS_TEXTO = 200
 TETO_SEGURANCA_CHARS = 1_200_000  # ~360k tokens; acórdão real nunca chega perto
 TOP_FAVORAVEIS = 30               # quantas aplicações favoráveis entram na síntese
-
-# Preço por milhão de tokens (entrada, saída). Cache: escrita 1,25x, leitura 0,1x.
-PRECOS_USD = {
-    "claude-opus-4-8": (5.0, 25.0),
-    "claude-opus-4-7": (5.0, 25.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
 
 PERFIL_SCHEMA = {
     "type": "json_schema",
@@ -205,79 +201,8 @@ INSTRUCAO_SINTESE = ("Redija, em markdown e português, um RELATÓRIO DE PRECEDE
 
 # ---------------------------------------------------------------- utilidades
 
-def sha256_texto(texto):
-    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
-
-
-def sha256_arquivo(caminho):
-    h = hashlib.sha256()
-    with open(caminho, "rb") as arq:
-        for bloco in iter(lambda: arq.read(65536), b""):
-            h.update(bloco)
-    return h.hexdigest()
-
-
 def texto_da_resposta(resposta):
     return "".join(b.text for b in resposta.content if b.type == "text")
-
-
-def carregar_jsonl(caminho):
-    """dict doc_id -> registro (última ocorrência vence; tolera duplicatas)."""
-    registros = {}
-    if os.path.exists(caminho):
-        with open(caminho, encoding="utf-8") as arq:
-            for linha in arq:
-                linha = linha.strip()
-                if linha:
-                    reg = json.loads(linha)
-                    registros[reg["doc_id"]] = reg
-    return registros
-
-
-def compactar_jsonl(caminho, registros):
-    """Reescreve o arquivo só com os registros vivos (remove duplicatas/obsoletos)."""
-    tmp = caminho + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as arq:
-        for reg in registros.values():
-            arq.write(json.dumps(reg, ensure_ascii=False) + "\n")
-    os.replace(tmp, caminho)
-
-
-def carregar_json(caminho):
-    if os.path.exists(caminho):
-        with open(caminho, encoding="utf-8") as arq:
-            return json.load(arq)
-    return None
-
-
-def salvar_json(caminho, dados):
-    tmp = caminho + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as arq:
-        json.dump(dados, arq, ensure_ascii=False, indent=1)
-    os.replace(tmp, caminho)
-
-
-class Contador:
-    """Acumula uso de tokens por modelo e calcula o custo em dólar."""
-
-    def __init__(self):
-        self.por_modelo = collections.defaultdict(
-            lambda: {"entrada": 0, "saida": 0, "cache_escrita": 0, "cache_leitura": 0})
-
-    def somar(self, modelo, uso):
-        registro = self.por_modelo[modelo]
-        registro["entrada"] += uso.input_tokens
-        registro["saida"] += uso.output_tokens
-        registro["cache_escrita"] += getattr(uso, "cache_creation_input_tokens", 0) or 0
-        registro["cache_leitura"] += getattr(uso, "cache_read_input_tokens", 0) or 0
-
-    def custo(self):
-        total = 0.0
-        for modelo, u in self.por_modelo.items():
-            entrada, saida = PRECOS_USD.get(modelo, (5.0, 25.0))
-            total += (u["entrada"] * entrada + u["cache_escrita"] * entrada * 1.25
-                      + u["cache_leitura"] * entrada * 0.1 + u["saida"] * saida) / 1_000_000
-        return total
 
 
 def bloco_sistema(texto):
